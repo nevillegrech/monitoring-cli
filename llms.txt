@@ -1,42 +1,34 @@
 # dedaub-monitoring
 
-> Command-line interface (CLI) for the Dedaub monitoring platform. Write SQL (DedaubQL) queries against on-chain data on Ethereum and EVM-compatible chains, test them, and deploy real-time blockchain alerts from your terminal. Package name: `monitoring-cli`. Installed command: `dedaub-monitoring`. License: MIT.
+> Command-line tool that queries the on-chain history of Ethereum and other EVM chains indexed by the Dedaub platform: call frames, events, transactions and storage changes, token balances, transfers and allowances with USD values, and the code of contracts as verified source or decompiled. It only reads: it stores no queries and creates no alerts. Written in Rust. Installed command: `dedaub-monitoring`. License: MIT.
 
 ## What it does
 
-- Query on-chain transactions, logs, and contracts with SQL (DedaubQL, a SQL dialect with macros for incremental, time-bounded execution).
-- Deploy real-time alerts with email notifications for events such as large transfers, fund drains, liquidations, oracle price deviations, and privileged admin/owner actions.
-- Manage query folders, schemas, run configs, execution logs, and fired-alert history without leaving the terminal.
-- Turn a query into a chart widget and put it on a dashboard.
-- Works across Ethereum, Arbitrum, Base, and other EVM-compatible chains supported by the Dedaub platform (selected via the `--network` option and DedaubQL macros).
-- Optional Claude Code skill (`dedaub-monitoring install-skill`, then `/dedaub-monitoring`) provides an AI-guided alert builder.
-
-## Use cases
-
-- Blockchain monitoring and on-chain alerting
-- Smart-contract monitoring and DeFi protocol monitoring
-- Security monitoring (drains, rug pulls, oracle manipulation, admin-key actions)
-- On-chain data analysis and exploration
+- Lookups that write fast SQL themselves and decode the rows with the ABI: calls to a contract, calls made by a contract, events, the frames of a transaction, its state changes, and a replay of the transaction under the next fork's gas rules.
+- Contract code: the verified source of a contract, or its decompiled code and the functions of its bytecode when it has none; and a search for contracts by their functions, name, deployer or code.
+- Ad-hoc SQL (`sql`) over the same tables, with macros that decode calls and events by signature.
+- Output for scripts and AI agents: TSV, JSON lines or CSV, exact numbers, nothing cut, one exit code per failure kind.
+- Commands wait in line for the account's three concurrent queries instead of failing.
 
 ## Key commands
 
-- `login` — authenticate via browser OAuth2 device flow
-- `token` — print the stored refresh token; set it as `DEDAUB_MONITORING_REFRESH_TOKEN` to run headless (CI, containers)
-- `tree` — show your query file tree
-- `create-folder` / `create-query` — create folders and queries
-- `write-query` / `read-query` — set or print a query's SQL
-- `run-query` — execute a query and print results
-- `get-schema` — show available tables, columns, and macros
-- `enable-alerts` / `disable-alerts` / `list-alerts` — manage alert notifications
-- `get-logs` / `get-alerts` — inspect execution logs and fired alerts
-- `check-widget` / `preview-widget` — check a chart widget of a query and print the rows it draws, with the same rules and SQL as the web Visualize tab
-- `create-widget` / `update-widget` / `delete-widget` / `list-widgets` / `get-widget` — manage widgets (charts, tables, values of a query)
-- `list-dashboards` / `get-dashboard` / `create-dashboard` / `update-dashboard` / `delete-dashboard` — manage dashboards
-- `add-widget` / `remove-widget` / `set-layout` / `set-default-dashboard` — place widgets on dashboards
-- `install-skill` — install the Claude Code skill
+- `status` — check the login; exit 0 when queries can run, 3 when not
+- `guide` — the query guide: tables, indexes, signature macros, and the rules for fast queries
+- `calls 0xCONTRACT [FUNCTION]` — calls to a contract: caller, gas given and used, status, arguments
+- `subcalls 0xCONTRACT` — calls a contract makes, and whether its function went on when one failed
+- `events 0xCONTRACT [EVENT]` — decoded events of a contract
+- `tx 0xHASH` — the call frames of a transaction
+- `replay 0xHASH` — the transaction under today's gas rules and the next fork's
+- `state 0xHASH` — storage slots, balances, nonces and code a transaction changed
+- `abi 0xCONTRACT`, `sig NAME|0xSELECTOR|0xTOPIC0` — functions of a contract; signature lookup
+- `code 0xCONTRACT` — verified source of a contract, or its decompiled code when it has none
+- `contracts [FUNCTION]…` — contracts that have these functions, verified or not; or by `--name`, `--deployer`, `--same-code`
+- `schema [TABLE]` — tables, columns, indexes
+- `sql "SELECT …"` — run a query; `expand` and `explain` show the expanded SQL and the plan
+- `login`, `logout`, `token` — browser login, and the token for machines without a browser
+- `install-skill` — install the agent skill
 
 ## Links
 
 - Source and documentation: https://github.com/Dedaub/monitoring-cli
-- Dedaub monitoring platform: https://app.dedaub.com
-- DedaubQL API reference: https://docs.dedaub.com/docs/monitoring/TSQLApiReference/
+- Dedaub platform: https://app.dedaub.com

@@ -1,359 +1,129 @@
 # dedaub-monitoring
 
-[![Agent skill on skills.sh](https://img.shields.io/badge/skills.sh-dedaub--monitoring-000000?style=flat)](https://www.skills.sh/dedaub/monitoring-cli)
-[![Claude Code plugin](https://img.shields.io/badge/Claude%20Code-plugin-D97757?style=flat)](#install-the-skill-on-its-own)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat)](LICENSE)
+Query the on-chain history of Ethereum and other EVM chains from the command line: every call frame, event and transaction that the [Dedaub](https://app.dedaub.com) platform indexes, token balances, transfers and allowances with their USD values, and the code of every contract, as verified source or decompiled. The tool reads; it stores no queries and creates no alerts.
 
-**dedaub-monitoring** is a command-line interface (CLI) for the [Dedaub](https://app.dedaub.com) monitoring platform. It lets you write SQL queries against on-chain data on Ethereum and EVM-compatible chains, test them, and deploy real-time blockchain alerts — all from your terminal.
-
-Use it to monitor on-chain activity and get notified about large transfers, fund drains, liquidations, oracle price deviations, privileged admin/owner actions, and any other event you can express in SQL. The package name is `monitoring-cli` and the installed command is `dedaub-monitoring`.
-
-**Use cases:** smart-contract monitoring, DeFi protocol monitoring, security monitoring, on-chain alerting, and blockchain data analysis across Ethereum, Arbitrum, Base, and other EVM chains.
-
-## Installation
-
-Pick the path that matches what you already have — all three end with the same installed `dedaub-monitoring` command.
-
-### From scratch — one command (recommended)
-
-The bootstrap installer does the whole setup: it installs [uv](https://docs.astral.sh/uv/) if it's missing (uv also provides the right Python, so you don't install Python yourself), installs the CLI, installs the agent skill, and starts login. Works on macOS, Linux, and Windows. It assumes `git` is already present (uv uses it to fetch the package) and will tell you if it isn't; everything else it handles.
-
-**macOS / Linux:**
-
-```bash
-curl -LsSf https://raw.githubusercontent.com/Dedaub/monitoring-cli/main/install.sh | sh
+```console
+$ dedaub-monitoring subcalls 0xd60247c6848b7ca29eddf63aa924e53db6ddd8ec --tolerated --tx --limit 2
+tx       block     time                  callee    depth  op    gas   gas_used  value            status       function  args  caller_function  caller_status  tx_from   tx_gas_limit  tx_gas_used  tx_status
+0xda2b…  26321549  2026-11-01T17:54:59Z  0x3d97…   3      CALL  2301  2301      860000000000000  ErrOutOfGas                  processMessage   ok             0x03ef…   732000        700245       ok
+0x1e3f…  26321409  2026-11-01T17:26:59Z  0x4047…   3      CALL  2301  2301      452434158312595  ErrOutOfGas                  processMessage   ok             0x03ef…   732000        700221       ok
 ```
 
-**Windows (PowerShell):**
+(Hashes and addresses are shortened here; the tool prints them whole.)
+
+It is built for scripts and AI agents: tab-separated rows with exact numbers, nothing cut, one failure kind per exit code, and commands that wait in line for the account's query slots instead of failing.
+
+## Install
+
+You need a Rust toolchain, 1.89 or newer ([rustup.rs](https://rustup.rs)).
+
+```sh
+cargo install --locked --git https://github.com/Dedaub/monitoring-cli
+dedaub-monitoring login          # prints a URL to open in a browser
+dedaub-monitoring status         # exit 0: queries can run
+```
+
+The installers run the same steps and also install the agent skill:
+
+```sh
+curl -LsSf https://raw.githubusercontent.com/Dedaub/monitoring-cli/main/install.sh | sh
+```
 
 ```powershell
 powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/Dedaub/monitoring-cli/main/install.ps1 | iex"
 ```
 
-Re-run any time to upgrade. The only step that isn't automated is the browser login, which prints a URL for you to open.
+From a clone, `make install-local` installs the working tree. The tool is developed and tested on Linux; the macOS and Windows builds are untested.
 
-### Already have uv — one line
+If the Python CLI (0.7 or earlier) is installed, remove it first with `uv tool uninstall monitoring-cli`. Its `dedaub-monitoring` sits in `~/.local/bin`, which often comes before cargo's `~/.cargo/bin` on `PATH`; `install.sh` and `make install` say so when that is the case.
 
-uv installs the CLI straight from the public repo over HTTPS — no clone, no SSH keys, and uv fetches the pinned Python for you:
+Each use renews the login; left unused, it expires after 48 hours. On a machine without a browser, log in elsewhere, print the token with `dedaub-monitoring token`, and set it as `DEDAUB_MONITORING_REFRESH_TOKEN`. A token set this way works for 48 hours from the moment it was issued. Treat it as a password.
 
-```bash
-uv tool install git+https://github.com/Dedaub/monitoring-cli
-dedaub-monitoring install-skill
-dedaub-monitoring login
+## Lookups
+
+A lookup writes its own SQL, in a shape that returns in seconds, and decodes the rows with the ABI.
+
+| Command | Shows |
+|---|---|
+| `calls 0xCONTRACT [FUNCTION]` | calls to a contract: caller, depth, gas given and used, status, arguments |
+| `subcalls 0xCONTRACT` | calls a contract makes, and whether the calling function went on when one failed |
+| `events 0xCONTRACT [EVENT]` | its events, decoded |
+| `tx 0xHASH` | the call frames of one transaction |
+| `replay 0xHASH` | the transaction re-executed under today's gas rules and the next fork's |
+| `state 0xHASH` | the storage slots, balances, nonces and code it changed |
+| `abi 0xCONTRACT`, `sig NAME` | a contract's functions; a function or event by name, selector or topic0 |
+| `code 0xCONTRACT` | a contract's verified source, or its decompiled code when it has none |
+| `contracts [FUNCTION]…` | contracts that have these functions, verified or not; or by `--name`, `--deployer`, `--same-code` |
+| `schema [TABLE]` | tables, columns and indexes |
+
+```sh
+dedaub-monitoring calls 0x7c7fdfca295a787ded12bb5c1a49a8d2cc20e3f8 transmit --tx --limit 5
+dedaub-monitoring calls 0xdac17f958d2ee523a2206206994597c13d831ec7 transfer --failed --returns --last 7d
+dedaub-monitoring events 0x27ca963c279c93801941e1eb8799c23f407d68e7 InboundMessageDispatched --tx
+dedaub-monitoring replay 0x9c06b464b5007c5c4e579fa9dac4cb3d78211ccbc88a22a93fa791361e28c6ce
+dedaub-monitoring code 0x27ca963c279c93801941e1eb8799c23f407d68e7 --files
+dedaub-monitoring contracts 'deposit(uint256,address)' 'redeem(uint256,address,address)' --no-source
 ```
 
-### Contributors — from a clone
+`code` and `abi` work on contracts without verified source: `code` prints the decompiled code, and `abi` the functions found in the bytecode. Through a proxy, both show the implementation.
 
-If you're hacking on the CLI, work from a checkout. From a clone, `make setup` runs the whole onboarding. It always installs the latest `main` from GitHub, also when your clone is behind or on another branch:
+`--help` on a command lists its filters. `--show-sql` prints the SQL a lookup ran. `--chain` takes a chain name or id (`ethereum`, `1`, `base`, `8453`, …).
 
-```bash
-git clone https://github.com/Dedaub/monitoring-cli.git
-cd monitoring-cli
-make setup         # latest main (uv tool install --force --reinstall git+…)  +  install-skill  +  login
-make setup-local   # the same with your working tree, to test a branch
+## SQL
+
+```sh
+dedaub-monitoring sql "
+SELECT tx_hash(d.block_number, d.tx_index) AS tx, d.from_a AS caller, d.gas, d.gas_used, d.error
+FROM {{transaction_detail(duration='30d', only_committed=False)}} d
+WHERE d.to_a = 0xdAC17F958D2ee523a2206206994597C13D831ec7
+  AND selector(d.calldata) = selector('transfer(address,uint256)')
+ORDER BY d.block_number DESC
+LIMIT 20"
 ```
 
-To update the CLI only, run `make install` (latest `main`) or `make install-local` (your working tree). Both print the installed version.
+The SQL also comes from `--file` or stdin. `dedaub-monitoring guide` prints the query guide: the tables and their indexes, the macros that decode calls and events by signature, and the rules that keep a query fast: a block bound on every table, short windows for filters and aggregates, no joins into `transaction_detail`. Read it before writing SQL.
 
-The skill picker and the login browser flow are interactive, so you stay in control of those two steps. Re-authenticate any time with `make login`.
+Before the SQL is sent, the tool makes these changes (`--show-sql` prints the result, `--raw` turns them off):
 
-## Authentication
+- an unquoted `0x…` of 20, 32, 16 or 4 bytes (an address, a hash, a code id, a selector) becomes a bytes literal;
+- `selector('f(uint256)')` and `topic0('E(address)')` become the hash of the signature;
+- an event signature given to the `logs` macro without `indexed` flags gets the flags and argument names of the known ABI. If a query over an event returns nothing, a note says whether the flags are the reason;
+- `numeric` columns are fetched as text, so that gas amounts print as integers and 256-bit values keep every digit.
 
-```bash
-dedaub-monitoring login    # or: make login
+Output is TSV by default, `--format json` gives one object per row, `--format csv` gives CSV. Rows go to stdout; notes and the row count go to stderr.
+
+## Behaviour to rely on
+
+- **Queueing.** An account runs three queries at a time. Commands on one machine share three slots through lock files, and wait up to `--wait` seconds (600) for a slot or for the server to accept the query. Do not wrap commands in retry loops.
+- **Timeouts.** A query that runs past `--timeout` (120 s) is revoked on the server, as is a query interrupted with Ctrl-C.
+- **Exit codes.** 0 success, 1 the server refused or failed the query, 2 bad arguments, 3 not logged in, 4 the query slots stayed busy, 5 timeout, 130 interrupted.
+- **State.** The login lives in `~/.config/dedaub/monitoring.json`. The access token, the id of the account's scratch query and the slot lock files live in `~/.cache/dedaub-monitoring` (`DEDAUB_MONITORING_STATE_DIR` moves it). In a sandbox that cannot write there, run `dedaub-monitoring status` once outside it: the sandboxed commands then find the lock files and the cached ids.
+- **One stored query.** The API runs SQL only in the context of a stored query, so the tool keeps a single empty one per account, `/_cli/scratch`, and never writes to it.
+
+## Agent skill
+
+```sh
+dedaub-monitoring install-skill            # Claude Code, and any of Codex, Cursor, .agents found here
 ```
 
-This opens a browser-based OAuth2 device flow. Your credentials are stored locally and reused across sessions; run `logout` to clear them. `logout` also revokes the token on the server, which ends that login for every copy of the token. `logout --local` removes only the local copy and keeps exported tokens valid. Every command accepts `--profile/-p` to keep separate credential sets (e.g. work vs personal).
-
-Login asks for an offline token, and every command stores the refreshed token it gets back, so a CLI (or an agent driving it) that runs regularly stays logged in without another browser round-trip. You only log in again after the token sits unused past the server's idle limit, or after `logout`.
-
-### Headless (CI, containers, remote agents)
-
-Log in once on a machine with a browser, then hand the token to the headless environment:
-
-```bash
-dedaub-monitoring token                                   # or: make token — prints the stored refresh token
-export DEDAUB_MONITORING_REFRESH_TOKEN="<that token>"      # on the headless side
-dedaub-monitoring entities                                # works with no config file
-```
-
-When `DEDAUB_MONITORING_REFRESH_TOKEN` is set it replaces the stored token. Endpoints come from the selected profile if a config file exists, otherwise from the production defaults. Nothing is written to disk in this mode, so the token is not rotated: it expires at its own expiry time and you export a fresh one then. Treat the value like a password. Running `logout` on the machine that exported the token also stops the exported token, unless you use `--local`.
-
-## Usage
-
-### Browse your queries
-
-```bash
-dedaub-monitoring tree
-```
-
-### Create a query
-
-```bash
-dedaub-monitoring create-folder "/My Alerts"
-dedaub-monitoring create-query "/My Alerts/large-eth-transfer"
-```
-
-### Write SQL
-
-```bash
-dedaub-monitoring write-query --id 1234 <<'SQL'
-SELECT
-    encode(t.tx_hash, 'hex') AS tx_hash,
-    encode(t.from_a, 'hex') AS sender,
-    t.callvalue / 1e18 AS eth_amount,
-    t.block_number
-FROM {{ethereum.outer_transaction()}} t
-WHERE t.callvalue > 100 * 1e18
-  AND t.status = true
-SQL
-```
-
-### Enable alerts
-
-```bash
-dedaub-monitoring enable-alerts \
-  --id 1234 \
-  --frequency 300 \
-  --network ethereum \
-  --alert-template "{{sender}} sent {{eth_amount}} ETH (tx: {{tx_hash}})" \
-  --unique-key "tx_hash" \
-  --email
-```
-
-`--network` (default `ethereum`) selects the chain the alert's run config and notifications
-apply to — set it to match the network used in your query's macros (e.g. `arbitrum`, `base`).
-The same `--network` option is available on `set-config`, `get-config`, `disable-alerts`, and
-`list-alerts`.
-
-### Check execution logs
-
-```bash
-dedaub-monitoring get-logs --id 1234
-```
-
-### See fired alerts
-
-```bash
-dedaub-monitoring get-alerts --id 1234
-```
-
-### Test a query
-
-```bash
-dedaub-monitoring run-query --id 1234 --duration 1h --limit 20
-```
-
-### Explore the schema
-
-```bash
-dedaub-monitoring get-schema --network ethereum
-dedaub-monitoring get-schema --network ethereum --macros
-```
-
-## DedaubQL
-
-Queries use DedaubQL, a dialect of SQL with macros that handle time-bounded incremental execution. Always use macros instead of raw table names:
-
-```sql
--- Use this
-FROM {{ethereum.outer_transaction()}} t
-
--- Not this (causes full table scans and timeouts)
-FROM ethereum.outer_transaction t
-```
-
-Key macros: `{{ethereum.outer_transaction()}}`, `{{etheruem.logs()}}`, `{{ethereum.contracts()}}`.
-
-All address and hash columns are `bytea`. Use `\x`-prefixed literals in WHERE clauses and `encode(col, 'hex')` in SELECT for readable output:
-
-```sql
-WHERE t.to_a = '\x7a250d5630b4cf539739df2c5dacb4c659f2488d'
-```
-
-Full reference: [DedaubQL API Reference](https://docs.dedaub.com/docs/monitoring/TSQLApiReference/)
-
-## Claude Code skill
-
-If you use [Claude Code](https://claude.ai/code), install the `/dedaub-monitoring` skill to get an AI-guided alert builder:
-
-```bash
-dedaub-monitoring install-skill
-```
-
-The skill ships in the shared "Agent Skills" format, so it can install to more than just Claude. With no flags, in a terminal you get a checkbox picker; otherwise it installs to Claude plus any other supported agent already present on the machine. Choose targets explicitly with `--agent`, or install everywhere with `--all`:
-
-```bash
-dedaub-monitoring install-skill --agent claude --agent codex   # specific agents
-dedaub-monitoring install-skill --all                          # claude, codex, cursor, .agents
-```
-
-### Install the skill on its own
-
-The skill is published straight from this repository, so an agent can pull it without the Python CLI. Both routes below read [`.claude-plugin/`](.claude-plugin/), where `marketplace.json` and `plugin.json` point at the packaged skill in [`packages/dedaub-skills/`](packages/dedaub-skills/).
-
-With [`npx skills`](https://skills.sh), which supports Claude Code, Codex, Cursor, Copilot, and 70+ other agents:
-
-```bash
-npx skills add Dedaub/monitoring-cli
-```
-
-As a Claude Code plugin, which keeps it current with `/plugin marketplace update`:
+The skill says when to use the tool, gives the five rules for writing SQL, and points to `dedaub-monitoring guide`. It is also published from this repository as a Claude Code plugin:
 
 ```
 /plugin marketplace add Dedaub/monitoring-cli
 /plugin install dedaub-monitoring@dedaub
 ```
 
-Installed as a plugin, the skill is namespaced: run `/dedaub-monitoring:dedaub-monitoring`. The skill drives the `dedaub-monitoring` command, so keep the CLI on your PATH — see [Installation](#installation).
+## Changes from 0.7
 
-Then type `/dedaub-monitoring` in Claude Code (or your agent) to start a session. The skill guides you through researching a protocol, writing alert queries, reviewing them, and deploying them.
+Version 0.8 is a rewrite in Rust that only queries. The commands of the Python CLI that stored queries and managed alerts, dashboards, widgets and webhooks are gone, and so are `run-query`, `create-query` and `write-query`: `sql` replaces them and needs no query id. Use the web app for alerts, or the last Python release (commit `ec438f4`). A login made with the Python CLI keeps working: both read `~/.config/dedaub/monitoring.json`.
 
-## Commands
+## Development
 
-The [Usage](#usage) walkthrough above covers the common path — log in, create a query, write SQL, enable alerts. This is the full reference, grouped by what you're doing: the **Account & session** commands get you set up, and the **Operations** sub-sections cover everything you do to existing queries afterwards.
-
-Commands that act on a query or folder take it **either** by `--id <id>` **or** by `--path /Folder/Name` (add `--entity-id` to reach another entity's tree), so once you know what you want you can edit it directly without browsing first. Every command also accepts `--profile/-p`.
-
-### Account & session
-
-| Command | Description |
-|---------|-------------|
-| `login` | Authenticate via browser (OAuth2 device flow) |
-| `logout` | Remove stored credentials and revoke them on the server (`--local` keeps the server session) |
-| `token` | Print the stored refresh token, for `DEDAUB_MONITORING_REFRESH_TOKEN` in headless setups |
-| `entities` | List entities (your user + orgs) available to you |
-| `entity` | Look up an entity by username |
-| `tree` | Show the query file tree for an entity |
-| `install-skill` | Install the agent skill to one or more agents (`--agent`, `--all`) — see [above](#claude-code-skill) |
-
-## Operations
-
-### Folders
-
-| Command | Description |
-|---------|-------------|
-| `create-folder` | Create a folder (intermediate folders are created automatically) |
-| `rename-folder` | Rename a folder (`--new-path`) |
-| `delete-folder` | Delete a folder |
-| `move-folder` | Move a folder under another parent (`--to-folder-id`) |
-| `subfolders` | List a folder's immediate subfolders |
-
-### Queries — create, edit & organize
-
-| Command | Description |
-|---------|-------------|
-| `create-query` | Create a new empty query |
-| `write-query` | Update a query's SQL (pass as an argument or pipe via stdin) |
-| `read-query` | Print a query's SQL |
-| `query-metadata` | Print full query metadata as JSON |
-| `move-query` | Move a query to another folder (`--to-folder-id`) |
-| `star-query` / `unstar-query` | Star or unstar (favourite) a query |
-| `query-by-key` | Fetch a query's metadata by its share key (`--key`) |
-| `generate-query` | Generate DedaubQL from natural language via the platform generator (for direct/programmatic use) |
-
-### Queries — inspect & validate (no execution)
-
-| Command | Description |
-|---------|-------------|
-| `get-schema` | Show available tables and columns — or macros with `--macros`; filter with `--network`/`--table` |
-| `preprocess-query` | Render DedaubQL macros and print the resulting SQL |
-| `explain-query` | Print the query's PostgreSQL EXPLAIN plan (it plans but does not execute, so it's free) |
-| `validate-query` | Fast compile check — exits 0 if the SQL is valid, else prints the PG error and exits 1 |
-| `query-columns` | Print the output columns (name + type) without running the query |
-| `format-query` | Pretty-print SQL (argument or stdin) |
-| `query-status` | Show materialization/backfill status as JSON |
-| `query-history` | List a query's saved version history |
-
-### Running queries
-
-| Command | Description |
-|---------|-------------|
-| `run-query` | Execute a query and print results (async; Ctrl-C or `--timeout` revokes the server-side task) |
-| `cancel-query` | Revoke a running async query task by id (`--task-id`; idempotent) |
-| `active-queries` | List the task ids of currently-running async queries |
-| `download-results` | Download a completed async query's results as CSV (`--task-id`) |
-| `materialize` | Trigger a materialization run for a query |
-| `reset-materialization` | Reset the materialized table, forcing a full recompute on the next run |
-
-### Materialization & alerts
-
-| Command | Description |
-|---------|-------------|
-| `get-config` | Show a query's materialization/scheduling config |
-| `set-config` | Set materialization/scheduling (`--materialize` TABLE/VIEW/INCREMENTAL, `--frequency`, `--incrementalization`, `--backfill`, `--immediate`) |
-| `enable-alerts` | Enable incremental alerts and notifications (`--email` and/or `--webhook-id`, `--alert-template`, `--unique-key`, `--frequency`) |
-| `disable-alerts` | Disable notifications (materialization is left unchanged) |
-| `list-alerts` | List all queries with alerts enabled |
-| `get-logs` | List execution logs (filter `--status`/`--since`, paginate with `--before`) |
-| `get-alerts` | List fired alert events (filter `--since`/`--before`, paginate with `--after-id`) |
-
-### Notifications & sharing
-
-| Command | Description |
-|---------|-------------|
-| `webhook` | Manage notification webhooks: `create`, `test`, `list`, `get`, `update`, `delete` (`--secret` for signing) |
-| `alert-filter` | Manage saved alert filters: `create`, `list`, `get`, `update`, `delete` (group queries/chains, `--colour`) |
-| `telegram-code` | Get the Telegram bot linking code for a query's notifications |
-| `share-query` / `unshare-query` | Share or unshare a query with a team (`--team-id`, `--perm` READ/WRITE) |
-
-### Widgets & dashboards
-
-A widget is a saved chart, table or single value of one query; a dashboard is a grid of widgets. A widget can be on no dashboard or on many. The checks and the SQL are the same as in the web app's Visualize tab. Each write prints the `https://app.dedaub.com/widget/<id>` or `/dashboard/<id>` link (the host follows your profile's API URL).
-
-| Command | Description |
-|---------|-------------|
-| `check-widget` | Check a widget like the Visualize tab: config keys and values, the axes the type needs, the query's columns. Exits 1 with one line per problem |
-| `preview-widget` | Run the SQL the dashboard runs for the widget and print its rows (`--sql` prints the SQL only; Ctrl-C or `--timeout` revokes the task) |
-| `create-widget` | Save a widget of a query (`--query-id`, `--type`, `--x`/`--y`/`--y1`, `--series-by`, `--x-label`/`--y-label`, `--timeframe`, `--config FILE\|-`, `--dashboard-id`); runs the checks first |
-| `update-widget` | Change a widget on every dashboard that has it; the flags merge into the saved config, `--clear KEY` removes a key |
-| `get-widget` / `list-widgets` | Show a widget (JSON), or list your widgets (`--query-id`, `--dashboard-id`) |
-| `delete-widget` | Delete a widget (it leaves every dashboard) |
-| `add-widget` / `remove-widget` | Put a widget on dashboards (`--dashboard-id`, repeatable), or take it off one |
-| `list-dashboards` / `get-dashboard` | List your dashboards (the default is marked), or show one with its widgets (JSON) |
-| `create-dashboard` / `update-dashboard` | Create a dashboard (`--public`, `--unlisted`, `--description`), or change its name, description or visibility |
-| `delete-dashboard` | Delete a dashboard; its widgets stay saved unless `--delete-widgets` |
-| `set-layout` | Set the place and size of widgets on the 12-column grid (`--layout FILE\|-`, a JSON list of `{widget_id, x, y, width, height}`) |
-| `set-default-dashboard` | Set the dashboard that `/dashboard` opens (`--id`), or `--clear` it |
-
-```bash
-dedaub-monitoring check-widget   --query-id 123 --type line --x day --y volume_usd --y-label 'Volume (\$)'
-dedaub-monitoring preview-widget --query-id 123 --type line --x day --y volume_usd --timeframe 7d
-dedaub-monitoring create-widget  --query-id 123 --type line --x day --y volume_usd --label '**Daily volume**'
-dedaub-monitoring add-widget     --id 456 --dashboard-id 78
+```sh
+cargo test                                   # unit tests, no network
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
 ```
-
-The widget types and every config key are in the skill's [`references/widgets.md`](packages/dedaub-skills/dedaub_skills/skills/dedaub-monitoring/references/widgets.md).
-
-## FAQ
-
-### What is dedaub-monitoring?
-
-`dedaub-monitoring` is a command-line tool for the Dedaub monitoring platform. You write SQL (DedaubQL) queries against on-chain Ethereum and EVM data, test them, and deploy real-time alerts that notify you by email when matching activity occurs.
-
-### How do I monitor on-chain activity from the command line?
-
-Install the CLI (`uv tool install .`), authenticate with `dedaub-monitoring login`, create a query with `create-query`, write your SQL with `write-query`, and enable notifications with `enable-alerts`. The query runs incrementally on a schedule and fires alerts when rows match.
-
-### How do I set up real-time alerts for large token or ETH transfers?
-
-Write a query that selects transfers above a threshold (see the [large ETH transfer example](#write-sql) above), then run `enable-alerts` with an `--alert-template` and `--unique-key` so each transfer is reported once. Set `--frequency` to control how often the query runs.
-
-### Which blockchains and networks are supported?
-
-Any chain supported by the Dedaub monitoring platform, including Ethereum, Arbitrum, and Base. Select the chain with the `--network` option (default `ethereum`) and the matching network argument inside your DedaubQL macros (e.g. `{{ethereum.outer_transaction()}}`).
-
-### How do I monitor a smart contract or DeFi protocol for drains, liquidations, or admin actions?
-
-Query the protocol's logs and calls with the `{{<c>.logs(...)}}` and `{{<c>.outer_transaction(...)}}` macros (`<c>` is the chain slug), filter for the events you care about (large withdrawals, liquidation calls, owner/admin function selectors, oracle updates), and enable alerts on the query. The Claude Code skill (`dedaub-monitoring install-skill`) can build these queries for you from a plain-language description.
-
-### Do I write raw SQL or a special dialect?
-
-You write **DedaubQL**, a dialect of SQL with macros for time-bounded incremental execution. Always use macros (e.g. `{{ethereum.outer_transaction()}}`) instead of raw table names to avoid full table scans. See [DedaubQL](#dedaubql) above.
-
-### Is there an AI-assisted way to build alerts?
-
-Yes. If you use [Claude Code](https://claude.ai/code), run `dedaub-monitoring install-skill` and type `/dedaub-monitoring` to get an AI-guided alert builder that researches a protocol, writes the query, and deploys the alert.
 
 ## License
 

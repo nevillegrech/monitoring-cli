@@ -1,52 +1,52 @@
-.PHONY: setup setup-local install install-local login token format lint typecheck test check
+.PHONY: setup setup-local install install-local login token format lint test check
 
 REPO := https://github.com/Dedaub/monitoring-cli
 
+# The binary where cargo installs it. The targets call it by this path, so that another
+# dedaub-monitoring earlier on PATH (the Python CLI lives in ~/.local/bin) is not run instead.
+DM := $(or $(CARGO_INSTALL_ROOT),$(CARGO_HOME),$(HOME)/.cargo)/bin/dedaub-monitoring
+
+# Print the installed version, and say so when a shell would run another dedaub-monitoring.
+INSTALLED = $(DM) --version && { first="$$(command -v dedaub-monitoring || true)"; \
+	[ "$$first" = "$(DM)" ] || echo "note: PATH resolves dedaub-monitoring to '$$first', not to $(DM)"; }
+
 # One-shot setup: install the latest CLI, install the agent skill, and log in.
-# install-skill (picker) and login (browser) are interactive on their own.
 setup: install
-	dedaub-monitoring install-skill
-	dedaub-monitoring login
+	$(DM) install-skill
+	$(DM) login
 
 # The same, but with the CLI of this working tree (to test a branch).
 setup-local: install-local
-	dedaub-monitoring install-skill
-	dedaub-monitoring login
+	$(DM) install-skill
+	$(DM) login
 
-# Always the latest main from GitHub, never the state of this clone: a clone
-# that is behind main installed an old CLI with no widget commands.
-# --reinstall makes uv fetch and build again, also when the version is the same.
+# Always the latest main from GitHub, never the state of this clone.
 install:
-	uv tool install --force --reinstall "git+$(REPO)"
-	dedaub-monitoring --version
+	cargo install --locked --force --git $(REPO)
+	@$(INSTALLED)
 
-# The CLI of this working tree, built again.
+# The CLI of this working tree.
 install-local:
-	uv tool install --force --reinstall .
-	dedaub-monitoring --version
+	cargo install --locked --force --path .
+	@$(INSTALLED)
 
-# Authenticate the installed CLI via the browser device flow.
 login:
-	dedaub-monitoring login
+	$(DM) login
 
-# Print the stored refresh token for headless use (CI, containers). Export it as
+# Print the stored refresh token for a machine without a browser. Export it as
 # DEDAUB_MONITORING_REFRESH_TOKEN there. Treat the value as a password.
 token:
-	@dedaub-monitoring token
+	@$(DM) token
 
 format:
-	uv run ruff check --fix monitoring_cli tests
-	uv run ruff format monitoring_cli tests
+	cargo fmt
 
 lint:
-	uv run ruff check monitoring_cli tests
-	uv run ruff format --check monitoring_cli tests
-
-typecheck:
-	uv run ty check monitoring_cli
+	cargo fmt --check
+	cargo clippy --all-targets -- -D warnings
 
 test:
-	uv run pytest
+	cargo test
 
 # Everything CI runs, in one target.
-check: lint typecheck test
+check: lint test
