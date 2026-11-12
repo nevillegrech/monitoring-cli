@@ -47,8 +47,9 @@ A lookup writes its own SQL, in a shape that returns in seconds, and decodes the
 |---|---|
 | `calls 0xCONTRACT [FUNCTION]` | calls to a contract: caller, depth, gas given and used, status, arguments |
 | `subcalls 0xCONTRACT` | calls a contract makes, and whether the calling function went on when one failed |
+| `calls … --count-by function` | the calls counted per function, caller, callee or status, with the gas they were given and used |
 | `events 0xCONTRACT [EVENT]` | its events, decoded |
-| `tx 0xHASH` | the call frames of one transaction |
+| `tx 0xHASH` | the call frames of one transaction, of any age |
 | `replay 0xHASH` | the transaction re-executed under today's gas rules and the next fork's |
 | `state 0xHASH` | the storage slots, balances, nonces and code it changed |
 | `abi 0xCONTRACT`, `sig NAME` | a contract's functions; a function or event by name, selector or topic0 |
@@ -59,6 +60,7 @@ A lookup writes its own SQL, in a shape that returns in seconds, and decodes the
 ```sh
 dedaub-monitoring calls 0x7c7fdfca295a787ded12bb5c1a49a8d2cc20e3f8 transmit --tx --limit 5
 dedaub-monitoring calls 0xdac17f958d2ee523a2206206994597c13d831ec7 transfer --failed --returns --last 7d
+dedaub-monitoring calls 0x0000000071727de22e5e9d8baf0edac6f37da032 --count-by function,status --last 2d
 dedaub-monitoring events 0x27ca963c279c93801941e1eb8799c23f407d68e7 InboundMessageDispatched --tx
 dedaub-monitoring replay 0x9c06b464b5007c5c4e579fa9dac4cb3d78211ccbc88a22a93fa791361e28c6ce
 dedaub-monitoring code 0x27ca963c279c93801941e1eb8799c23f407d68e7 --files
@@ -81,21 +83,24 @@ ORDER BY d.block_number DESC
 LIMIT 20"
 ```
 
-The SQL also comes from `--file` or stdin. `dedaub-monitoring guide` prints the query guide: the tables and their indexes, the macros that decode calls and events by signature, and the rules that keep a query fast: a block bound on every table, short windows for filters and aggregates, no joins into `transaction_detail`. Read it before writing SQL.
+The SQL also comes from `--file` or stdin. `dedaub-monitoring guide` prints the query guide: the tables and their indexes, the helpers, and the rules that keep a query fast: a block bound on every table, short windows for filters and aggregates, no joins into `transaction_detail`. Read it before writing SQL. It has three more pages: `guide contracts` (code and proxies), `guide tokens` (balances, transfers, allowances, USD) and `guide incidents` (who lost what, who else runs the code, where the money went).
 
 Before the SQL is sent, the tool makes these changes (`--show-sql` prints the result, `--raw` turns them off):
 
 - an unquoted `0x…` of 20, 32, 16 or 4 bytes (an address, a hash, a code id, a selector) becomes a bytes literal;
-- `selector('f(uint256)')` and `topic0('E(address)')` become the hash of the signature;
+- `selector('f(uint256)')`, `topic0('E(address)')` and `keccak256('text')` become the hash they stand for;
 - an event signature given to the `logs` macro without `indexed` flags gets the flags and argument names of the known ABI. If a query over an event returns nothing, a note says whether the flags are the reason;
-- `numeric` columns are fetched as text, so that gas amounts print as integers and 256-bit values keep every digit.
+- `numeric` columns are fetched as text, so that gas amounts print as integers and 256-bit values keep every digit;
+- result columns that share a name are renamed (`max`, `max_2`): the API would return only one of them.
+
+A column that does not exist is answered with the columns the table has.
 
 Output is TSV by default, `--format json` gives one object per row, `--format csv` gives CSV. Rows go to stdout; notes and the row count go to stderr.
 
 ## Behaviour to rely on
 
 - **Queueing.** An account runs three queries at a time. Commands on one machine share three slots through lock files, and wait up to `--wait` seconds (600) for a slot or for the server to accept the query. Do not wrap commands in retry loops.
-- **Timeouts.** A query that runs past `--timeout` (120 s) is revoked on the server, as is a query interrupted with Ctrl-C.
+- **Timeouts.** A query that runs past `--timeout` (100 s) is revoked on the server, as is a query interrupted with Ctrl-C. The default is under the 120 s after which an agent's shell gives up on a command, so the advice printed on a timeout is seen.
 - **Exit codes.** 0 success, 1 the server refused or failed the query, 2 bad arguments, 3 not logged in, 4 the query slots stayed busy, 5 timeout, 130 interrupted.
 - **State.** The login lives in `~/.config/dedaub/monitoring.json`. The access token, the id of the account's scratch query and the slot lock files live in `~/.cache/dedaub-monitoring` (`DEDAUB_MONITORING_STATE_DIR` moves it). In a sandbox that cannot write there, run `dedaub-monitoring status` once outside it: the sandboxed commands then find the lock files and the cached ids.
 - **One stored query.** The API runs SQL only in the context of a stored query, so the tool keeps a single empty one per account, `/_cli/scratch`, and never writes to it.

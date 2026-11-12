@@ -39,6 +39,11 @@ pub fn bytes_cell(table: &Table, row: &[Value], name: &str) -> Vec<u8> {
     cell(table, row, name).as_str().and_then(sig::unhex).unwrap_or_default()
 }
 
+/// A creation's calldata is the new contract's init code: it starts with no selector.
+pub fn is_creation(op: &Value) -> bool {
+    op.as_str().is_some_and(|op| op.starts_with("CREATE"))
+}
+
 /// `ok`, the frame's own error, or `reverted` for a frame undone by a revert further up.
 pub fn frame_status(error: &Value, committed: &Value) -> Value {
     match (error.as_str(), committed.as_bool()) {
@@ -289,6 +294,82 @@ pub fn transaction(session: &mut Session, chain: &str, hash: &str) -> Res<Value>
     session.get(&format!("/api/transaction/{chain}/{hash}"), &[])
 }
 
+/// Seconds a transaction's frames may take to come back by position. From an uncompressed
+/// chunk they take one to four.
+const BY_POSITION_SECONDS: u64 = 20;
+
+const CALL_OPCODES: [&str; 6] = ["CALL", "STATICCALL", "DELEGATECALL", "CALLCODE", "CREATE", "CREATE2"];
+
+/// Quote the numbers of one key of a JSON text: a wei amount does not fit a float.
+fn quote_numbers(json: &str, key: &str) -> String {
+    let marker = format!("\"{key}\":");
+    let mut out = String::with_capacity(json.len() + 64);
+    let mut rest = json;
+    while let Some(at) = rest.find(&marker) {
+        let after = at + marker.len();
+        out.push_str(&rest[..after]);
+        rest = &rest[after..];
+        let spaces = rest.len() - rest.trim_start().len();
+        let digits = rest[spaces..].bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0 {
+            out.push_str(&format!("{}\"{}\"", &rest[..spaces], &rest[spaces..spaces + digits]));
+            rest = &rest[spaces + digits..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// One frame of the platform's trace and the frames below it, as rows of `TRACE_COLUMNS` in
+/// execution order. A frame ends in a node of its own that carries its error.
+fn trace_rows(node: &Value, depth: usize, undone: bool, rows: &mut Vec<Vec<Value>>) {
+    let is_call = |n: &Value| n["opcode"].as_str().is_some_and(|op| CALL_OPCODES.contains(&op));
+    if !is_call(node) {
+        return;
+    }
+    let children: Vec<&Value> = node["children"].as_array().into_iter().flatten().collect();
+    let error =
+        children.iter().rev().find(|c| !is_call(c) && c.get("error").is_some()).and_then(|end| end["error"].as_str()).map(|e| match e {
+            "execution reverted" => "ErrExecutionReverted".to_string(),
+            "out of gas" => "ErrOutOfGas".to_string(),
+            other => other.to_string(),
+        });
+    let undone = undone || error.is_some();
+    let lower = |v: &Value| v.as_str().map(|a| json!(a.to_ascii_lowercase())).unwrap_or(Value::Null);
+    rows.push(vec![
+        node["vm_step"].clone(),
+        json!(depth),
+        node["opcode"].clone(),
+        lower(&node["from_a"]),
+        lower(&node["to_a"]),
+        Value::Null,
+        node["gas_used"].clone(),
+        node["callvalue"].clone(),
+        error.map(Value::String).unwrap_or(Value::Null),
+        json!(!undone),
+        json!(format!("0x{}", node["calldata"].as_str().unwrap_or("").trim_start_matches("0x"))),
+    ]);
+    for child in children {
+        trace_rows(child, depth + 1, undone, rows);
+    }
+}
+
+/// The columns of the query in `tx`, which a trace is turned into.
+const TRACE_COLUMNS: [&str; 11] = ["step", "depth", "op", "from_a", "to_a", "gas", "gas_used", "value", "error", "committed", "calldata"];
+
+/// The frames of a transaction from the platform's trace. It knows every frame of any
+/// transaction, but not the gas a frame was given.
+fn trace_frames(session: &mut Session, hash: &str, opts: &QueryOpts) -> Res<Table> {
+    let path = format!("/api/transaction/{}/{hash}/debug", opts.chain);
+    let text = session.get_text(&path, &[("compact", "true".to_string())], 170)?;
+    let trace: Value = serde_json::from_str(&quote_numbers(&text, "callvalue"))
+        .map_err(|e| Fail::Other(format!("{path} did not answer with JSON: {e}")))?;
+    let mut table = Table::new(&TRACE_COLUMNS);
+    trace_rows(&trace["trace_node"], 0, false, &mut table.rows);
+    table.rows = table.rows.into_iter().skip(opts.offset as usize).take(opts.limit as usize).collect();
+    Ok(table)
+}
+
 /// The call frames of one transaction, in execution order. Returns the header line too.
 pub fn tx(session: &mut Session, hash: &str, with_args: bool, opts: &QueryOpts) -> Res<(String, Table)> {
     let hash = tx_hash(hash)?;
@@ -309,8 +390,20 @@ pub fn tx(session: &mut Session, hash: &str, with_args: bool, opts: &QueryOpts) 
         if with_args { "d.calldata" } else { "substring(d.calldata FROM 1 FOR 4)" },
         opts.limit + opts.offset,
     );
-    let fetched = run::query(session, &sql, opts)?.table;
-    let selector_of = |row: &[Value]| -> Option<[u8; 4]> { bytes_cell(&fetched, row, "calldata").get(..4)?.try_into().ok() };
+    // Frames older than a few months are stored by contract, and a read by position alone does
+    // not come back from there: the platform's trace has them.
+    let quick = QueryOpts { timeout: opts.timeout.min(BY_POSITION_SECONDS), ..opts.clone() };
+    let (fetched, traced) = match run::query(session, &sql, &quick) {
+        Ok(outcome) => (outcome.table, false),
+        Err(Fail::Timeout(_)) => (trace_frames(session, &hash, opts)?, true),
+        Err(e) => return Err(e),
+    };
+    let selector_of = |row: &[Value]| -> Option<[u8; 4]> {
+        if is_creation(cell(&fetched, row, "op")) {
+            return None;
+        }
+        bytes_cell(&fetched, row, "calldata").get(..4)?.try_into().ok()
+    };
     let mut selectors: Vec<[u8; 4]> = fetched.rows.iter().filter_map(|r| selector_of(r)).collect();
     selectors.sort();
     selectors.dedup();
@@ -332,6 +425,7 @@ pub fn tx(session: &mut Session, hash: &str, with_args: bool, opts: &QueryOpts) 
         out.push(match (function, calldata.len()) {
             (Some(function), _) => json!(sig::function_text(function)),
             (None, 0) => json!(""),
+            (None, _) if is_creation(cell(&fetched, row, "op")) => json!(""),
             (None, _) => json!(format!("0x{}", hex::encode(&calldata[..calldata.len().min(4)]))),
         });
         if with_args {
@@ -341,7 +435,7 @@ pub fn tx(session: &mut Session, hash: &str, with_args: bool, opts: &QueryOpts) 
         table.rows.push(out);
     }
     let failed = fetched.rows.first().is_some_and(|r| !cell(&fetched, r, "error").is_null());
-    let header = format!(
+    let mut header = format!(
         "# tx {hash} block {block} index {index} from {} to {} gas_limit {} gas_used {} gas_refund {} gas_price {} {}",
         record["from_a"].as_str().unwrap_or("?"),
         record["to_a"].as_str().unwrap_or("(contract creation)"),
@@ -351,6 +445,9 @@ pub fn tx(session: &mut Session, hash: &str, with_args: bool, opts: &QueryOpts) 
         record["gas_price"],
         if failed { "FAILED" } else { "succeeded" },
     );
+    if traced {
+        header.push_str("\n# frames from the platform's trace (too old to read by position): the gas given to a frame is not known");
+    }
     Ok((header, table))
 }
 
@@ -618,6 +715,21 @@ fn schema_json(session: &mut Session) -> Res<Value> {
     Ok(schema)
 }
 
+/// The columns of a table of the chain, or of a table shared by the chains.
+pub fn table_columns(session: &mut Session, chain: &str, table: &str) -> Option<Vec<String>> {
+    let schema = schema_json(session).ok()?;
+    [chain, "common"].into_iter().find_map(|namespace| {
+        let found = schema[namespace].as_array()?.iter().find(|t| t["name"].as_str() == Some(table))?;
+        Some(found["columns"].as_array()?.iter().filter_map(|c| c["column_name"].as_str().map(str::to_string)).collect())
+    })
+}
+
+/// `ethereum.logs` and `common.code` are the tables `logs` and `code`.
+fn bare_table(name: &str) -> String {
+    let lower = name.trim().to_ascii_lowercase();
+    lower.rsplit('.').next().unwrap_or(&lower).to_string()
+}
+
 /// Table names of a chain, or the columns and indexes of the tables whose name contains `table`.
 pub fn schema(session: &mut Session, chain: &str, table: Option<&str>) -> Res<String> {
     let schema = schema_json(session)?;
@@ -631,7 +743,7 @@ pub fn schema(session: &mut Session, chain: &str, table: Option<&str>) -> Res<St
                 out.push_str(&format!("{namespace}: {}\n", names.join(" ")));
             }
             Some(wanted) => {
-                let wanted = wanted.to_ascii_lowercase();
+                let wanted = bare_table(wanted);
                 let exact = tables.iter().any(|t| t["name"].as_str() == Some(&wanted));
                 for t in tables.iter().filter(|t| {
                     let name = t["name"].as_str().unwrap_or("");
@@ -683,6 +795,37 @@ mod tests {
         assert_eq!(frame_status(&json!("ErrOutOfGas"), &json!(false)), json!("ErrOutOfGas"));
         assert_eq!(frame_status(&Value::Null, &json!(false)), json!("reverted"));
         assert_eq!(frame_status(&Value::Null, &json!(true)), json!("ok"));
+    }
+
+    #[test]
+    fn a_trace_becomes_the_rows_of_its_frames() {
+        let text = r#"{"trace_node": {"opcode": "CALL", "from_a": "0xAA", "to_a": "0xBB", "vm_step": 0, "gas_used": 900, "callvalue": 12345678901234567890123, "calldata": "a9059cbb00", "children": [
+            {"opcode": "STATICCALL", "from_a": "0xBB", "to_a": "0xCC", "vm_step": 1, "gas_used": 10, "callvalue": 0, "calldata": "", "children": [{"opcode": "RETURN", "error": null}]},
+            {"opcode": "LOG2", "topics": []},
+            {"opcode": "CALL", "from_a": "0xBB", "to_a": "0xDD", "vm_step": 2, "gas_used": 50, "callvalue":7, "calldata": "0x12345678", "children": [
+                {"opcode": "DELEGATECALL", "from_a": "0xDD", "to_a": "0xEE", "vm_step": 3, "gas_used": 5, "callvalue": 7, "calldata": "12345678", "children": [{"opcode": "RETURN", "error": null}]},
+                {"opcode": "REVERT", "error": "execution reverted"}]},
+            {"opcode": "RETURN", "error": null}]}}"#;
+        let trace: Value = serde_json::from_str(&quote_numbers(text, "callvalue")).unwrap();
+        let mut table = Table::new(&TRACE_COLUMNS);
+        trace_rows(&trace["trace_node"], 0, false, &mut table.rows);
+        let column = |name: &str| table.rows.iter().map(|r| cell(&table, r, name).clone()).collect::<Vec<_>>();
+        assert_eq!(column("step"), [json!(0), json!(1), json!(2), json!(3)]);
+        assert_eq!(column("depth"), [json!(0), json!(1), json!(1), json!(2)]);
+        assert_eq!(column("to_a"), [json!("0xbb"), json!("0xcc"), json!("0xdd"), json!("0xee")]);
+        // Every digit of a wei amount survives, and the trace gives no gas limit.
+        assert_eq!(column("value"), [json!("12345678901234567890123"), json!("0"), json!("7"), json!("7")]);
+        assert!(column("gas").iter().all(Value::is_null));
+        assert_eq!(column("calldata"), [json!("0xa9059cbb00"), json!("0x"), json!("0x12345678"), json!("0x12345678")]);
+        let status: Vec<Value> = table.rows.iter().map(|r| frame_status(cell(&table, r, "error"), cell(&table, r, "committed"))).collect();
+        assert_eq!(status, [json!("ok"), json!("ok"), json!("ErrExecutionReverted"), json!("reverted")]);
+    }
+
+    #[test]
+    fn a_table_may_be_named_with_its_schema() {
+        assert_eq!(bare_table("ethereum.proxy_implementation_latest"), "proxy_implementation_latest");
+        assert_eq!(bare_table(" common.Code "), "code");
+        assert_eq!(bare_table("logs"), "logs");
     }
 
     #[test]

@@ -70,7 +70,12 @@ mod tests {
         assert!(SKILL.starts_with("---\nname: dedaub-monitoring\n"));
         assert!(SKILL.contains("dedaub-monitoring guide"));
         assert!(SKILL.contains("get_historical_block_number"));
-        assert!(SKILL.len() < 3000, "the skill is loaded in every session that uses the tool");
+        for page in ["guide contracts", "guide tokens", "guide incidents"] {
+            assert!(SKILL.contains(page));
+        }
+        // The flags of `calls` are in it since agents spent a call on `--help` in 14 sessions of 15.
+        assert!(SKILL.contains("--count-by function"));
+        assert!(SKILL.len() < 3200, "the skill is loaded in every session that uses the tool");
     }
 
     #[test]

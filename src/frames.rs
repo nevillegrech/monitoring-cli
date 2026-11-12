@@ -28,6 +28,38 @@ pub enum Side {
     From,
 }
 
+/// What `--count-by` groups the calls by.
+#[derive(Clone, Copy, Debug, PartialEq, clap::ValueEnum)]
+pub enum By {
+    Function,
+    Caller,
+    Callee,
+    Status,
+}
+
+impl By {
+    fn name(self) -> &'static str {
+        match self {
+            By::Function => "function",
+            By::Caller => "caller",
+            By::Callee => "callee",
+            By::Status => "status",
+        }
+    }
+
+    /// The key over a row of the sample `s`. The status reads as it does in the listing.
+    fn expr(self) -> &'static str {
+        match self {
+            // A creation's calldata is init code, which starts with no selector.
+            By::Function => "CASE WHEN s.call_opcode IN ('CREATE', 'CREATE2') THEN NULL ELSE s.sel END",
+            By::Caller => "s.from_a",
+            By::Callee => "s.to_a",
+            // `error` is an enum: as text it can share a column with the two other words.
+            By::Status => "CASE WHEN s.error IS NOT NULL THEN s.error::text WHEN s.committed THEN 'ok' ELSE 'reverted' END",
+        }
+    }
+}
+
 pub struct CallsArgs {
     pub side: Side,
     /// The contract on the leading side.
@@ -46,6 +78,8 @@ pub struct CallsArgs {
     /// How many of the newest calls the unindexed filters look at.
     pub scan: u32,
     pub raw: bool,
+    /// Count the calls per these keys instead of listing them.
+    pub count_by: Vec<By>,
 }
 
 fn selectors_of(function: &str, abi: &ContractAbi) -> Res<Vec<[u8; 4]>> {
@@ -76,6 +110,10 @@ const TOLERATED_CANDIDATES: u32 = 500;
 
 const FRAME_COLUMNS: &str = "d.block_number, d.tx_index, d.vm_step_start, d.from_a, d.to_a, d.caller_vm_step_stack, d.call_opcode,\n           \
                              d.gas, d.gas_used, d.callvalue, d.error, d.committed, d.calldata";
+
+/// What a count needs of a call: the selector, not the calldata.
+const COUNT_COLUMNS: &str = "d.block_number, d.vm_step_start, d.from_a, d.to_a, d.call_opcode, d.gas, d.gas_used, d.error, d.committed,\n           \
+                             selector(d.calldata) AS sel";
 
 struct FrameQuery {
     last: String,
@@ -110,16 +148,48 @@ impl FrameQuery {
         )
     }
 
+    /// The newest `limit` calls that the index leads to.
+    fn newest(&self, columns: &str, limit: u32) -> String {
+        format!(
+            "SELECT {columns}\n    FROM {}\n    WHERE {}\n    ORDER BY d.block_number DESC\n    LIMIT {limit}",
+            self.source(),
+            self.indexed.join("\n      AND ")
+        )
+    }
+
+    /// Calls counted per key. An aggregate reads every row it is given, so like the filters it
+    /// gets the newest `scan` calls of the window, not the window.
+    fn count_sql(&self, keys: &[By]) -> String {
+        let named: Vec<String> = keys.iter().enumerate().map(|(i, key)| format!("{} AS k{}", key.expr(), i + 1)).collect();
+        let positions: Vec<String> = (1..=keys.len()).map(|i| i.to_string()).collect();
+        let outer: Vec<String> = (1..=keys.len()).map(|i| format!("g.k{i}")).collect();
+        let filters = if self.filters.is_empty() { String::new() } else { format!("\n    WHERE {}", self.filters.join("\n      AND ")) };
+        format!(
+            "SELECT g.*, ts(g.first_block) AS first, ts(g.last_block) AS last\n\
+             FROM (\n    \
+             SELECT {},\n           \
+             count(*) AS calls, count(*) FILTER (WHERE s.error IS NOT NULL) AS failed,\n           \
+             min(s.gas) AS gas_min, max(s.gas) AS gas_max, max(s.gas_used) AS gas_used_max,\n           \
+             min(s.block_number) AS first_block, max(s.block_number) AS last_block\n    \
+             FROM (\n        {}\n    ) s{filters}\n    \
+             GROUP BY {}\n    \
+             ORDER BY calls DESC, {}\n    \
+             LIMIT {}\n\
+             ) g\n\
+             ORDER BY g.calls DESC, {}",
+            named.join(", "),
+            self.newest(COUNT_COLUMNS, self.scan).replace('\n', "\n    "),
+            positions.join(", "),
+            positions.join(", "),
+            self.rows,
+            outer.join(", "),
+        )
+    }
+
     fn sql(&self) -> String {
         let columns = if self.returns { format!("{FRAME_COLUMNS}, d.returndata") } else { FRAME_COLUMNS.to_string() };
         let kept = if self.tolerated { TOLERATED_CANDIDATES.max(self.rows) } else { self.rows };
-        let scan = |limit: u32| {
-            format!(
-                "SELECT {columns}\n    FROM {}\n    WHERE {}\n    ORDER BY d.block_number DESC\n    LIMIT {limit}",
-                self.source(),
-                self.indexed.join("\n      AND ")
-            )
-        };
+        let scan = |limit: u32| self.newest(&columns, limit);
         let rows = if self.filters.is_empty() {
             scan(kept)
         } else {
@@ -177,8 +247,91 @@ fn call_text(function: Option<&Function>, calldata: &[u8]) -> (String, String) {
     }
 }
 
+/// The keys of a count, each once. The lead contract is the same on every row.
+fn count_keys(side: Side, given: &[By]) -> Res<Vec<By>> {
+    let (lead, command, other) = if side == Side::To { (By::Callee, "calls", "caller") } else { (By::Caller, "subcalls", "callee") };
+    if given.contains(&lead) {
+        return Err(Fail::Usage(format!(
+            "the {} of every row is the contract itself: `{command}` counts by function, {other} or status",
+            lead.name()
+        )));
+    }
+    let mut keys: Vec<By> = Vec::new();
+    for key in given {
+        if !keys.contains(key) {
+            keys.push(*key);
+        }
+    }
+    Ok(keys)
+}
+
+/// The function of a selector, named apart from another selector's function of the same name.
+fn function_names(selectors: &[[u8; 4]], known: impl Fn(&[u8; 4]) -> Option<String>) -> BTreeMap<[u8; 4], String> {
+    let named: Vec<([u8; 4], Option<String>)> = selectors.iter().map(|s| (*s, known(s))).collect();
+    named
+        .iter()
+        .map(|(selector, name)| {
+            let hex = format!("0x{}", hex::encode(selector));
+            let text = match name {
+                Some(name) if named.iter().filter(|(_, other)| other.as_ref() == Some(name)).count() > 1 => format!("{name} {hex}"),
+                Some(name) => name.clone(),
+                None => hex,
+            };
+            (*selector, text)
+        })
+        .collect()
+}
+
+/// The calls of the sample counted per key, with the gas they were given and used.
+fn counts(session: &mut Session, side: Side, abi: &ContractAbi, query: &FrameQuery, keys: &[By], opts: &QueryOpts) -> Res<Table> {
+    let fetched = run::query(session, &query.count_sql(keys), opts)?.table;
+    let probe = QueryOpts { limit: 1, offset: 0, show_sql: false, ..opts.clone() };
+    if let Some(end) = run::query(session, &query.sample_end(), &probe).ok().and_then(|o| o.table.rows.into_iter().next()) {
+        run::note(&format!(
+            "counted over the newest {} calls only, back to block {} ({}); --scan N counts further back",
+            query.scan,
+            end[0],
+            end[1].as_str().unwrap_or("?")
+        ));
+    }
+    let key_column = |i: usize| format!("k{}", i + 1);
+    let selector_of = |row: &[Value], i: usize| -> Option<[u8; 4]> { bytes_cell(&fetched, row, &key_column(i)).get(..4)?.try_into().ok() };
+    let function_key = keys.iter().position(|key| *key == By::Function);
+    let mut selectors: Vec<[u8; 4]> = fetched.rows.iter().filter_map(|row| selector_of(row, function_key?)).collect();
+    selectors.sort();
+    selectors.dedup();
+    // The lead contract's ABI names the functions called on it; calls it makes go to others.
+    let own = |selector: &[u8; 4]| if side == Side::To { abi.functions.get(selector) } else { None };
+    let unknown: Vec<[u8; 4]> = selectors.iter().filter(|s| own(s).is_none()).copied().collect();
+    let searched = lookups::functions_by_selector(session, &unknown);
+    let functions = function_names(&selectors, |s| own(s).or_else(|| searched.get(s)).map(|f| f.name.clone()));
+    const COUNTS: [&str; 7] = ["calls", "failed", "gas_min", "gas_max", "gas_used_max", "first", "last"];
+    let names: Vec<&str> = keys.iter().map(|key| key.name()).chain(COUNTS).collect();
+    let mut table = Table::new(&names);
+    for column in table.columns.iter_mut().filter(|c| c.name.starts_with("gas")) {
+        column.ty = "numeric".to_string();
+    }
+    for row in &fetched.rows {
+        let mut out: Vec<Value> = Vec::with_capacity(names.len());
+        for (i, key) in keys.iter().enumerate() {
+            let value = cell(&fetched, row, &key_column(i));
+            out.push(match key {
+                // Two groups have no function: creations, and calls without calldata (a plain
+                // transfer of ETH). The listing tells them apart by its `op` column.
+                By::Function if value.is_null() => json!("(creation)"),
+                By::Function => json!(selector_of(row, i).map(|s| functions[&s].clone()).unwrap_or_else(|| "(no selector)".to_string())),
+                _ => value.clone(),
+            });
+        }
+        out.extend(COUNTS.iter().map(|c| cell(&fetched, row, c).clone()));
+        table.rows.push(out);
+    }
+    Ok(table)
+}
+
 pub fn calls(session: &mut Session, args: &CallsArgs, opts: &QueryOpts) -> Res<Table> {
     let lead = lookups::address(&args.address)?;
+    let count_by = count_keys(args.side, &args.count_by)?;
     let abi = lookups::contract_abi(session, &opts.chain, &lead)?;
     if let Some(implementation) = &abi.implementation {
         run::note(&format!("{lead} is a proxy; its functions are named with the ABI of its implementation {implementation}"));
@@ -218,6 +371,9 @@ pub fn calls(session: &mut Session, args: &CallsArgs, opts: &QueryOpts) -> Res<T
         scan: args.scan.max(rows),
         rows,
     };
+    if !count_by.is_empty() {
+        return counts(session, args.side, &abi, &query, &count_by, opts);
+    }
     let fetched = run::query(session, &query.sql(), opts)?.table;
     if !query.filters.is_empty() && (fetched.rows.len() as u32) < opts.limit {
         // Fewer rows than asked for: say whether the whole window was searched.
@@ -234,7 +390,13 @@ pub fn calls(session: &mut Session, args: &CallsArgs, opts: &QueryOpts) -> Res<T
     if args.raw {
         return Ok(fetched);
     }
-    let selector_in = |row: &[Value], column: &str| -> Option<[u8; 4]> { bytes_cell(&fetched, row, column).get(..4)?.try_into().ok() };
+    let creation = |row: &[Value]| lookups::is_creation(cell(&fetched, row, "op"));
+    let selector_in = |row: &[Value], column: &str| -> Option<[u8; 4]> {
+        if creation(row) {
+            return None;
+        }
+        bytes_cell(&fetched, row, column).get(..4)?.try_into().ok()
+    };
     // The lead contract's ABI names the functions called on it; calls it makes go to others.
     let own = |selector: &[u8; 4]| if args.side == Side::To { abi.functions.get(selector) } else { None };
     let mut unknown: Vec<[u8; 4]> = fetched.rows.iter().filter_map(|r| selector_in(r, "calldata")).filter(|s| own(s).is_none()).collect();
@@ -262,7 +424,8 @@ pub fn calls(session: &mut Session, args: &CallsArgs, opts: &QueryOpts) -> Res<T
     for row in &fetched.rows {
         let calldata = bytes_cell(&fetched, row, "calldata");
         let function = selector_in(row, "calldata").and_then(|s| own(&s).or_else(|| searched.get(&s)));
-        let (name, decoded) = call_text(function, &calldata);
+        let (name, decoded) =
+            if creation(row) { (String::new(), format!("0x{}", hex::encode(&calldata))) } else { call_text(function, &calldata) };
         let mut out: Vec<Value> = ["tx", "block", "time", counterparty, "depth", "op", "gas", "gas_used", "value"]
             .iter()
             .map(|c| cell(&fetched, row, c).clone())
@@ -350,6 +513,51 @@ mod tests {
         assert!(sql.contains("LIMIT 500\n    ) r\n    OFFSET 0\n) x\nWHERE x.parent->>'error' IS NULL\nLIMIT 20"));
         assert!(!sql.contains("JOIN"));
         assert!(!sql.contains("ORDER BY x."));
+    }
+
+    #[test]
+    fn a_count_groups_a_bounded_sample_and_reads_no_calldata() {
+        let q = FrameQuery { filters: vec!["s.vm_step_start = 0".to_string()], ..query() };
+        let sql = q.count_sql(&[By::Function, By::Status]);
+        assert!(sql.contains(
+            "SELECT CASE WHEN s.call_opcode IN ('CREATE', 'CREATE2') THEN NULL ELSE s.sel END AS k1, \
+             CASE WHEN s.error IS NOT NULL THEN s.error::text WHEN s.committed THEN 'ok' ELSE 'reverted' END AS k2,"
+        ));
+        assert!(sql.contains(
+            "selector(d.calldata) AS sel\n        FROM {{transaction_detail(duration='30d', only_committed=False)}} d\n        \
+             WHERE d.to_a = 0x00000000000000000000000000000000000000aa\n        ORDER BY d.block_number DESC\n        LIMIT 20000\n    ) s\n    \
+             WHERE s.vm_step_start = 0\n    GROUP BY 1, 2\n    ORDER BY calls DESC, 1, 2\n    LIMIT 20\n) g\nORDER BY g.calls DESC, g.k1, g.k2"
+        ));
+        assert!(!sql.contains("d.calldata,"));
+        assert!(
+            query()
+                .count_sql(&[By::Caller])
+                .contains("LIMIT 20000\n    ) s\n    GROUP BY 1\n    ORDER BY calls DESC, 1\n    LIMIT 20\n) g")
+        );
+    }
+
+    #[test]
+    fn count_keys_are_taken_once_and_the_lead_contract_is_not_one() {
+        assert_eq!(count_keys(Side::To, &[By::Function, By::Caller, By::Function]).unwrap(), vec![By::Function, By::Caller]);
+        assert!(
+            matches!(count_keys(Side::To, &[By::Callee]), Err(Fail::Usage(m)) if m.contains("`calls` counts by function, caller or status"))
+        );
+        assert!(
+            matches!(count_keys(Side::From, &[By::Caller]), Err(Fail::Usage(m)) if m.contains("`subcalls` counts by function, callee or status"))
+        );
+    }
+
+    #[test]
+    fn functions_that_share_a_name_show_their_selectors() {
+        let names = function_names(&[[1, 0, 0, 0], [2, 0, 0, 0], [3, 0, 0, 0], [4, 0, 0, 0]], |s| match s[0] {
+            1 | 2 => Some("swap".to_string()),
+            3 => Some("mint".to_string()),
+            _ => None,
+        });
+        assert_eq!(names[&[1, 0, 0, 0]], "swap 0x01000000");
+        assert_eq!(names[&[2, 0, 0, 0]], "swap 0x02000000");
+        assert_eq!(names[&[3, 0, 0, 0]], "mint");
+        assert_eq!(names[&[4, 0, 0, 0]], "0x04000000");
     }
 
     #[test]

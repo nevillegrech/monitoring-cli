@@ -29,6 +29,33 @@ use crate::output::Format;
 use crate::run::QueryOpts;
 
 const GUIDE: &str = include_str!("guide.md");
+const GUIDE_CONTRACTS: &str = include_str!("guide_contracts.md");
+const GUIDE_TOKENS: &str = include_str!("guide_tokens.md");
+const GUIDE_INCIDENTS: &str = include_str!("guide_incidents.md");
+
+/// A page of the guide besides the first.
+#[derive(Clone, Copy, Debug, PartialEq, clap::ValueEnum)]
+enum Page {
+    Contracts,
+    Tokens,
+    Incidents,
+    All,
+}
+
+/// The guide is in pages so that each fits the output an agent's shell shows in one piece.
+fn guide(page: Option<Page>) -> String {
+    match page {
+        None => GUIDE.to_string(),
+        Some(Page::Contracts) => GUIDE_CONTRACTS.to_string(),
+        Some(Page::Tokens) => GUIDE_TOKENS.to_string(),
+        Some(Page::Incidents) => GUIDE_INCIDENTS.to_string(),
+        Some(Page::All) => [GUIDE, GUIDE_CONTRACTS, GUIDE_TOKENS, GUIDE_INCIDENTS].join("\n"),
+    }
+}
+
+/// Seconds a query may run unless `--timeout` says otherwise. An agent's shell gives up on a
+/// command after 120 s: a query revoked before that gets to print what to change.
+const DEFAULT_TIMEOUT: u64 = 100;
 
 /// (name, chain id) of every chain the platform indexes. The name is the SQL schema.
 const CHAINS: [(&str, u64); 11] = [
@@ -79,7 +106,7 @@ struct Limits {
     #[arg(long, default_value_t = 0)]
     offset: u32,
     /// Seconds the query may run before it is revoked
-    #[arg(long, default_value_t = 120)]
+    #[arg(long, default_value_t = DEFAULT_TIMEOUT)]
     timeout: u64,
     /// Seconds to wait for a free query slot (the account runs 3 queries at a time)
     #[arg(long, default_value_t = 600)]
@@ -92,7 +119,7 @@ struct Limits {
 #[derive(Args, Clone)]
 struct Paging {
     /// Time window, e.g. 1h, 24h, 30d
-    #[arg(long, default_value = "30d")]
+    #[arg(long, alias = "duration", default_value = "30d")]
     last: String,
     /// Rows to return (at most 500)
     #[arg(long, default_value_t = 20)]
@@ -101,7 +128,7 @@ struct Paging {
     #[arg(long, default_value_t = 0)]
     offset: u32,
     /// Seconds the query may run before it is revoked
-    #[arg(long, default_value_t = 120)]
+    #[arg(long, default_value_t = DEFAULT_TIMEOUT)]
     timeout: u64,
     /// Seconds to wait for a free query slot
     #[arg(long, default_value_t = 600)]
@@ -119,12 +146,15 @@ struct CallColumns {
     /// Add each call's transaction: sender, gas limit, gas used, status
     #[arg(long)]
     tx: bool,
-    /// How many of the newest calls the filters (--failed, --top-level, --from, --to) look at
+    /// How many of the newest calls the filters (--failed, --top-level, --from, --to) and --count-by look at
     #[arg(long, default_value_t = 20000, value_name = "N")]
     scan: u32,
     /// The rows as queried, with calldata as hex
     #[arg(long)]
     raw: bool,
+    /// Count the calls instead of listing them: per function, caller (callee for subcalls) or status, or several (function,status)
+    #[arg(long, value_enum, value_delimiter = ',', value_name = "KEY", conflicts_with_all = ["returns", "tx", "raw"])]
+    count_by: Vec<frames::By>,
 }
 
 #[derive(Args, Clone)]
@@ -137,7 +167,7 @@ struct SqlInput {
     #[arg(long, value_name = "PATH")]
     file: Option<std::path::PathBuf>,
     /// Window of macros that give no duration=, e.g. 1h, 24h, 30d
-    #[arg(long, default_value = "24h")]
+    #[arg(long, alias = "duration", default_value = "24h")]
     last: String,
     /// End of that window (ISO 8601) instead of now
     #[arg(long, value_name = "TIME")]
@@ -263,7 +293,7 @@ enum Command {
         #[arg(long)]
         no_source: bool,
         /// Only contracts created in this window, e.g. 24h, 30d
-        #[arg(long, value_name = "WINDOW")]
+        #[arg(long, alias = "duration", value_name = "WINDOW")]
         last: Option<String>,
         /// Rows to return (at most 500)
         #[arg(long, default_value_t = 20)]
@@ -272,7 +302,7 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         offset: u32,
         /// Seconds the query may run before it is revoked
-        #[arg(long, default_value_t = 120)]
+        #[arg(long, default_value_t = DEFAULT_TIMEOUT)]
         timeout: u64,
         /// Seconds to wait for a free query slot
         #[arg(long, default_value_t = 600)]
@@ -299,8 +329,12 @@ enum Command {
         #[command(flatten)]
         input: SqlInput,
     },
-    /// Print the query guide: tables, macros, the rules that keep a query fast
-    Guide,
+    /// Print the query guide: lookups, tables, helpers, the rules that keep a query fast; or one of its other pages
+    Guide {
+        /// contracts (code and proxies), tokens (balances, transfers, USD), incidents (three queries for an incident), or all
+        #[arg(value_enum)]
+        page: Option<Page>,
+    },
     /// Check the login: exit 0 when queries can run, 3 when not
     Status,
     /// Log in through the browser
@@ -541,7 +575,7 @@ fn token(cli: &Cli) -> Res<()> {
 fn dispatch(cli: &Cli, interrupted: Arc<AtomicBool>) -> Res<()> {
     let open = || Session::open(cli.profile.as_deref(), interrupted.clone());
     match &cli.command {
-        Command::Guide => print_text(GUIDE),
+        Command::Guide { page } => print_text(&guide(*page)),
         Command::Login { base_url, oidc_host, client_id, realm } => {
             let profile = Profile {
                 base_url: base_url.clone(),
@@ -578,6 +612,7 @@ fn dispatch(cli: &Cli, interrupted: Arc<AtomicBool>) -> Res<()> {
                 with_tx: extra.tx,
                 scan: extra.scan,
                 raw: extra.raw,
+                count_by: extra.count_by.clone(),
             };
             let table = frames::calls(&mut open()?, &args, &opts)?;
             print_table(cli, &table, paging.max_cell)?;
@@ -598,6 +633,7 @@ fn dispatch(cli: &Cli, interrupted: Arc<AtomicBool>) -> Res<()> {
                 with_tx: extra.tx,
                 scan: extra.scan,
                 raw: extra.raw,
+                count_by: extra.count_by.clone(),
             };
             let table = frames::calls(&mut open()?, &args, &opts)?;
             print_table(cli, &table, paging.max_cell)?;
@@ -613,7 +649,7 @@ fn dispatch(cli: &Cli, interrupted: Arc<AtomicBool>) -> Res<()> {
             Ok(())
         }
         Command::Tx { hash, args, offset, max_cell } => {
-            let opts = lookup_opts(cli, run::MAX_LIMIT, *offset, 120, 600)?;
+            let opts = lookup_opts(cli, run::MAX_LIMIT, *offset, DEFAULT_TIMEOUT, 600)?;
             let (header, table) = lookups::tx(&mut open()?, hash, *args, &opts)?;
             eprintln!("{header}");
             print_table(cli, &table, *max_cell)?;
@@ -633,7 +669,7 @@ fn dispatch(cli: &Cli, interrupted: Arc<AtomicBool>) -> Res<()> {
             print_table(cli, &table, *max_cell)
         }
         Command::Abi { address } => {
-            let table = lookups::abi(&mut open()?, address, &lookup_opts(cli, 1, 0, 120, 600)?)?;
+            let table = lookups::abi(&mut open()?, address, &lookup_opts(cli, 1, 0, DEFAULT_TIMEOUT, 600)?)?;
             print_table(cli, &table, 0)
         }
         Command::Code { address, decompiled, all, files, file, proxy } => {
@@ -706,6 +742,67 @@ mod tests {
     fn the_command_line_is_consistent() {
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    fn parse(args: &[&str]) -> Result<Command, String> {
+        let mut line = vec!["dedaub-monitoring"];
+        line.extend(args);
+        Cli::try_parse_from(line).map(|cli| cli.command).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn every_page_of_the_guide_fits_a_shell_and_the_rules_come_early() {
+        for page in [None, Some(Page::Contracts), Some(Page::Tokens), Some(Page::Incidents)] {
+            assert!(guide(page).len() < 30_000, "{page:?} is longer than an agent's shell shows in one piece");
+        }
+        assert!(matches!(parse(&["guide"]), Ok(Command::Guide { page: None })));
+        assert!(matches!(parse(&["guide", "incidents"]), Ok(Command::Guide { page: Some(Page::Incidents) })));
+        // Agents read the first hundred or so lines: the rules and the helpers must be there.
+        let head: Vec<&str> = GUIDE.lines().take(100).collect();
+        for needle in
+            ["## The rules that keep a query fast", "**8. Give the planner", "block_timestamp(block_number)", "### When a query fails"]
+        {
+            assert!(head.iter().any(|line| line.contains(needle)), "`{needle}` is not in the first 100 lines of the guide");
+        }
+        // The whole guide stays small: an example that a lookup or another page already gives is left out.
+        let all = guide(Some(Page::All));
+        assert!(all.len() < 30_000, "the guide has grown to {} bytes", all.len());
+        for page in ["guide contracts", "guide tokens", "guide incidents"] {
+            assert!(head.iter().any(|line| line.contains(page)), "the first page does not name `{page}`");
+        }
+        assert!(guide(Some(Page::All)).contains("# dedaub-monitoring guide: an incident"));
+    }
+
+    #[test]
+    fn duration_is_another_word_for_last() {
+        let address = "0x00000000000000000000000000000000000000aa";
+        assert!(matches!(parse(&["calls", address, "--duration", "365d"]), Ok(Command::Calls { paging, .. }) if paging.last == "365d"));
+        assert!(matches!(parse(&["events", address, "--last", "7d"]), Ok(Command::Events { paging, .. }) if paging.last == "7d"));
+        assert!(matches!(parse(&["sql", "SELECT 1", "--duration", "2d"]), Ok(Command::Sql { input, .. }) if input.last == "2d"));
+        assert!(
+            matches!(parse(&["contracts", "--deployer", address, "--duration", "30d"]), Ok(Command::Contracts { last, .. }) if last.as_deref() == Some("30d"))
+        );
+    }
+
+    #[test]
+    fn a_query_is_revoked_before_a_shell_gives_up_on_it() {
+        assert!(matches!(parse(&["sql", "SELECT 1"]), Ok(Command::Sql { limits, .. }) if limits.timeout < 120));
+        assert!(matches!(parse(&["sql", "SELECT 1", "--timeout", "300"]), Ok(Command::Sql { limits, .. }) if limits.timeout == 300));
+    }
+
+    #[test]
+    fn calls_are_counted_by_one_key_or_several() {
+        use frames::By;
+        let address = "0x00000000000000000000000000000000000000aa";
+        assert!(
+            matches!(parse(&["calls", address, "--count-by", "function,status"]), Ok(Command::Calls { extra, .. }) if extra.count_by == [By::Function, By::Status])
+        );
+        assert!(
+            matches!(parse(&["subcalls", address, "--count-by", "callee"]), Ok(Command::Subcalls { extra, .. }) if extra.count_by == [By::Callee])
+        );
+        assert!(matches!(parse(&["calls", address]), Ok(Command::Calls { extra, .. }) if extra.count_by.is_empty()));
+        assert!(parse(&["calls", address, "--count-by", "function", "--tx"]).is_err());
+        assert!(parse(&["calls", address, "--count-by", "gas"]).is_err());
     }
 
     fn sql_of(args: &[&str]) -> Result<(Option<String>, u32), String> {

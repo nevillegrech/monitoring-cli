@@ -13,11 +13,12 @@
 ## Key commands
 
 - `status` — check the login; exit 0 when queries can run, 3 when not
-- `guide` — the query guide: tables, indexes, signature macros, and the rules for fast queries
+- `guide` — the query guide: tables, indexes, helpers, and the rules for fast queries; more pages with `guide contracts`, `guide tokens`, `guide incidents`
 - `calls 0xCONTRACT [FUNCTION]` — calls to a contract: caller, gas given and used, status, arguments
 - `subcalls 0xCONTRACT` — calls a contract makes, and whether its function went on when one failed
+- `calls`/`subcalls … --count-by function|caller|callee|status` — the calls counted, with the gas they were given and used
 - `events 0xCONTRACT [EVENT]` — decoded events of a contract
-- `tx 0xHASH` — the call frames of a transaction
+- `tx 0xHASH` — the call frames of a transaction, of any age
 - `replay 0xHASH` — the transaction under today's gas rules and the next fork's
 - `state 0xHASH` — storage slots, balances, nonces and code a transaction changed
 - `abi 0xCONTRACT`, `sig NAME|0xSELECTOR|0xTOPIC0` — functions of a contract; signature lookup

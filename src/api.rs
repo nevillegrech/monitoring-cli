@@ -271,6 +271,15 @@ impl Session {
         self.ok(reply, path)
     }
 
+    /// The answer as text, for a body whose numbers do not all fit a float.
+    pub fn get_text(&mut self, path: &str, query: &[(&str, String)], seconds: u64) -> Res<String> {
+        let reply = self.call(Method::GET, path, query, None, Duration::from_secs(seconds))?;
+        if (200..=299).contains(&reply.status) {
+            return Ok(reply.text);
+        }
+        self.ok(reply, path).map(|_| String::new())
+    }
+
     pub fn post(&mut self, path: &str, query: &[(&str, String)], body: &Value) -> Res<Value> {
         let reply = self.call(Method::POST, path, query, Some(body), Duration::from_secs(60))?;
         self.ok(reply, path)

@@ -2,8 +2,8 @@
 //!
 //! - a bare `0x…` of 4, 16, 20 or 32 bytes (a selector, a code id, an address, a hash) becomes
 //!   a `bytea` literal (the server does this for addresses only);
-//! - `selector('transfer(address,uint256)')` and `topic0('Transfer(address,address,uint256)')`
-//!   become the hash they stand for;
+//! - `selector('transfer(address,uint256)')`, `topic0('Transfer(address,address,uint256)')` and
+//!   `keccak256('any text')` become the hash they stand for;
 //! - an event signature given to the `logs` macro without any `indexed` flag gets the flags and
 //!   argument names of the known ABI: the macro matches topics by these flags, and a wrong
 //!   layout returns no rows without an error;
@@ -190,7 +190,8 @@ fn rewrite_hex(code: &str, prev_is_word: bool) -> String {
     out
 }
 
-/// `selector('f(uint256)')` and `topic0('E(address)')`, written as SQL function calls.
+/// `selector('f(uint256)')`, `topic0('E(address)')` and `keccak256('text')`, written as SQL
+/// function calls.
 fn rewrite_hash_calls(segs: &mut Vec<Seg>) -> Res<()> {
     let mut i = 0;
     while i + 2 < segs.len() {
@@ -199,13 +200,15 @@ fn rewrite_hash_calls(segs: &mut Vec<Seg>) -> Res<()> {
         } else {
             None
         };
-        // A hex literal is calldata for the server's own `selector(bytea)`.
-        let signature = unquote(&segs[i + 1].text).to_string();
-        if let Some((name, head_len, tail_skip)) = call.filter(|_| signature.contains('(')) {
-            let literal = if name == "selector" {
-                sig::bytea(sig::parse_function(&signature)?.selector().as_slice())
-            } else {
-                sig::bytea(sig::parse_event(&signature)?.selector().as_slice())
+        let signature = unquote(&segs[i + 1].text).replace("''", "'");
+        // A hex literal is calldata for the server's own `selector(bytea)`, and it is bytes, not
+        // text, for a hash.
+        let ours = |name: &str| if name == "keccak256" { !is_hex_text(&signature) } else { signature.contains('(') };
+        if let Some((name, head_len, tail_skip)) = call.filter(|(name, ..)| ours(name)) {
+            let literal = match name {
+                "selector" => sig::bytea(sig::parse_function(&signature)?.selector().as_slice()),
+                "topic0" => sig::bytea(sig::parse_event(&signature)?.selector().as_slice()),
+                _ => sig::bytea(alloy_primitives::keccak256(signature.as_bytes()).as_slice()),
             };
             let merged = format!("{}{}{}", &segs[i].text[..head_len], literal, &segs[i + 2].text[tail_skip..]);
             segs.splice(i..i + 3, [Seg { kind: Kind::Code, text: merged }]);
@@ -216,11 +219,16 @@ fn rewrite_hash_calls(segs: &mut Vec<Seg>) -> Res<()> {
     Ok(())
 }
 
-/// If `before` ends in `selector(` or `topic0(` and `after` starts with `)`: the function's
-/// name, the length of `before` without the call, and how much of `after` the `)` takes.
+fn is_hex_text(text: &str) -> bool {
+    let text = text.trim();
+    text.starts_with("0x") || text.starts_with("0X") || text.starts_with("\\x")
+}
+
+/// If `before` ends in `selector(`, `topic0(` or `keccak256(` and `after` starts with `)`: the
+/// function's name, the length of `before` without the call, and how much of `after` the `)` takes.
 fn hash_call(before: &str, after: &str) -> Option<(&'static str, usize, usize)> {
     let head = before.trim_end().strip_suffix('(')?.trim_end();
-    let name = ["selector", "topic0"].into_iter().find(|n| head.to_ascii_lowercase().ends_with(n))?;
+    let name = ["selector", "topic0", "keccak256"].into_iter().find(|n| head.to_ascii_lowercase().ends_with(n))?;
     let start = head.len() - name.len();
     if head[..start].bytes().last().is_some_and(|b| is_word(b) || b == b'.') {
         return None;
@@ -417,6 +425,76 @@ fn strip_trailing_semicolons(segs: &mut [Seg]) {
     }
 }
 
+/// Words that can follow a table in FROM and are not its alias.
+const AFTER_TABLE: [&str; 22] = [
+    "where",
+    "join",
+    "on",
+    "inner",
+    "left",
+    "right",
+    "full",
+    "cross",
+    "natural",
+    "using",
+    "group",
+    "order",
+    "limit",
+    "offset",
+    "union",
+    "except",
+    "intersect",
+    "having",
+    "window",
+    "tablesample",
+    "fetch",
+    "for",
+];
+
+/// The tables a query reads, under the names the query gives them: `(alias, table)`. A macro
+/// counts as its table, and a table without an alias goes by its own name.
+pub fn table_aliases(sql: &str) -> Vec<(String, String)> {
+    let mut tokens: Vec<String> = Vec::new();
+    for seg in lex(sql) {
+        match seg.kind {
+            Kind::Code => {
+                let mut word = String::new();
+                for ch in seg.text.chars() {
+                    if ch.is_alphanumeric() || ch == '_' || ch == '.' || ch == '$' {
+                        word.push(ch);
+                        continue;
+                    }
+                    tokens.extend((!word.is_empty()).then(|| std::mem::take(&mut word)));
+                    tokens.extend((!ch.is_whitespace()).then(|| ch.to_string()));
+                }
+                tokens.extend((!word.is_empty()).then_some(word));
+            }
+            Kind::Jinja => tokens.push(seg.text.trim_start_matches(['{', ' ']).split(['(', ' ', '}']).next().unwrap_or("").to_string()),
+            Kind::Ident => tokens.push(unquote(&seg.text).to_string()),
+            Kind::Str => tokens.push("'".to_string()),
+            Kind::Comment => {}
+        }
+    }
+    let is_name = |t: &str| t.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_');
+    let mut found = Vec::new();
+    for (i, token) in tokens.iter().enumerate() {
+        let lower = token.to_ascii_lowercase();
+        let Some(table) = tokens.get(i + 1).filter(|t| (lower == "from" || lower == "join") && is_name(t)) else { continue };
+        let table = table.rsplit('.').next().unwrap_or(table).to_ascii_lowercase();
+        if table == "lateral" || table == "select" {
+            continue;
+        }
+        let next = |k: usize| tokens.get(i + k).map(|t| t.to_ascii_lowercase());
+        let alias = match next(2) {
+            Some(word) if word == "as" => next(3),
+            Some(word) if is_name(&word) && !AFTER_TABLE.contains(&word.as_str()) => Some(word),
+            _ => None,
+        };
+        found.push((alias.unwrap_or_else(|| table.clone()), table));
+    }
+    found
+}
+
 pub fn rewrite(sql: &str, abis: &mut dyn Abis) -> Res<Rewritten> {
     let mut out = Rewritten::default();
     let mut segs = lex(sql);
@@ -509,6 +587,34 @@ pub mod tests {
         let untouched = "SELECT selector(d.calldata), common.selector('\\xa9059cbb'), reselector('f()') FROM t";
         assert_eq!(run(untouched).sql, untouched);
         assert!(matches!(rewrite("SELECT selector('f(uint256')", &mut known()), Err(Fail::Usage(_))));
+    }
+
+    #[test]
+    fn keccak256_of_a_text_literal() {
+        assert_eq!(
+            run("SELECT 1 FROM logs l WHERE l.topic0 = keccak256('Transfer(address,address,uint256)') AND x = cast(KECCAK256 ('a''b') AS bytea)")
+                .sql,
+            format!(
+                "SELECT 1 FROM logs l WHERE l.topic0 = '\\xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'::bytea \
+                 AND x = cast({} AS bytea)",
+                sig::bytea(alloy_primitives::keccak256(b"a'b").as_slice())
+            )
+        );
+        // Bytes are not text, and another schema's function is not ours.
+        let untouched = "SELECT keccak256('0x1234'), keccak256(d.calldata), common.keccak256('abc') FROM t d";
+        assert_eq!(run(untouched).sql, untouched);
+    }
+
+    #[test]
+    fn tables_are_found_under_their_aliases() {
+        let sql = "WITH a AS (SELECT 1 FROM {{ ethereum.logs('E(uint256 x)', duration='2d') }} l WHERE l.x > 0)\n\
+                   SELECT o.gas -- FROM comment c\nFROM outer_transaction AS o JOIN a USING (block_number)\n\
+                   LEFT JOIN common.code k ON true, (SELECT 1 FROM token_ledger WHERE 'from x' = 'y') z";
+        let pairs = |list: &[(&str, &str)]| list.iter().map(|(a, t)| (a.to_string(), t.to_string())).collect::<Vec<_>>();
+        assert_eq!(
+            table_aliases(sql),
+            pairs(&[("l", "logs"), ("o", "outer_transaction"), ("a", "a"), ("k", "code"), ("token_ledger", "token_ledger")])
+        );
     }
 
     #[test]

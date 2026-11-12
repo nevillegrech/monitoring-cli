@@ -8,6 +8,7 @@ use serde_json::Value;
 use crate::api::{self, Session, Window};
 use crate::config;
 use crate::error::{Fail, Res};
+use crate::lookups;
 use crate::output::{Column, Table};
 use crate::rewrite::{self, Abis, EventUse, Rewritten};
 use crate::sig::{self, EventAbi};
@@ -106,27 +107,59 @@ fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-/// The API sends `numeric` as a float: 230000.0 for a gas amount, and a rounded value for
-/// anything above 2^53. Selecting such columns as text keeps every digit.
-fn exact_numerics(sql: &str, columns: &[Column]) -> Option<String> {
-    if !columns.iter().any(|c| c.ty == "numeric") {
-        return None;
+/// A name of its own for every result column: a repeated name gets a number (`max`, `max_2`).
+fn unique_names(columns: &[Column]) -> Vec<String> {
+    let mut names: Vec<String> = Vec::with_capacity(columns.len());
+    for (i, column) in columns.iter().enumerate() {
+        let base = if column.name.is_empty() { format!("column_{}", i + 1) } else { column.name.clone() };
+        let mut name = base.clone();
+        let mut n = 2;
+        while names.contains(&name) {
+            name = format!("{base}_{n}");
+            n += 1;
+        }
+        names.push(name);
     }
-    let unique = columns.iter().enumerate().all(|(i, c)| !c.name.is_empty() && columns[..i].iter().all(|d| d.name != c.name));
-    if !unique {
-        note(
-            "two result columns share a name, so the API returns only one of them and numbers stay floats: give each column its own alias",
-        );
-        return None;
+    names
+}
+
+/// The query as it is sent, and the columns it then returns. The SQL as written is wrapped for
+/// two reasons. The API sends `numeric` as a float: 230000.0 for a gas amount, and a rounded
+/// value for anything above 2^53; selecting such columns as text keeps every digit. And it
+/// sends each row as an object, so of two columns with one name it keeps one: they are renamed.
+fn exact(sql: &str, columns: &[Column]) -> (String, Vec<Column>) {
+    let names = unique_names(columns);
+    let renamed = names.iter().zip(columns).any(|(name, c)| *name != c.name);
+    if !renamed && !columns.iter().any(|c| c.ty == "numeric") {
+        return (sql.to_string(), columns.to_vec());
     }
-    let list: Vec<String> = columns
+    let quoted: Vec<String> = names.iter().map(|n| quote_ident(n)).collect();
+    let list: Vec<String> = quoted
         .iter()
-        .map(|c| {
-            let name = quote_ident(&c.name);
-            if c.ty == "numeric" { format!("_q.{name}::text AS {name}") } else { format!("_q.{name}") }
-        })
+        .zip(columns)
+        .map(|(name, c)| if c.ty == "numeric" { format!("_q.{name}::text AS {name}") } else { format!("_q.{name}") })
         .collect();
-    Some(format!("SELECT {}\nFROM (\n{sql}\n) _q", list.join(", ")))
+    let alias = if renamed { format!("_q({})", quoted.join(", ")) } else { "_q".to_string() };
+    let columns = names.into_iter().zip(columns).map(|(name, c)| Column { name, ty: c.ty.clone() }).collect();
+    (format!("SELECT {}\nFROM (\n{sql}\n) {alias}", list.join(", ")), columns)
+}
+
+/// A column that does not exist is a guess at the schema: answer it with the columns that the
+/// table has.
+fn with_columns(session: &mut Session, sql: &str, chain: &str, message: String) -> String {
+    let missing =
+        message.find("column ").and_then(|at| message[at + 7..].split_once(" does not exist")).map(|(name, _)| name.replace('"', ""));
+    let Some(missing) = missing else { return message };
+    let alias = missing.rsplit_once('.').map(|(alias, _)| alias.to_ascii_lowercase());
+    let mut tables: Vec<String> =
+        rewrite::table_aliases(sql).into_iter().filter(|(a, _)| alias.as_ref().is_none_or(|wanted| a == wanted)).map(|(_, t)| t).collect();
+    tables.dedup();
+    let known: Vec<String> = tables
+        .iter()
+        .filter_map(|table| lookups::table_columns(session, chain, table).map(|columns| format!("`{table}` has: {}", columns.join(", "))))
+        .take(3)
+        .collect();
+    if known.is_empty() { message } else { format!("{message}\n{}", known.join("\n")) }
 }
 
 fn sleep_watching(session: &Session, duration: Duration) -> Res<()> {
@@ -216,8 +249,16 @@ pub fn run(session: &mut Session, rewritten: &Rewritten, opts: &QueryOpts) -> Re
     let (columns, sent) = if opts.raw {
         (Vec::new(), rewritten.sql.clone())
     } else {
-        let columns = columns(session, &rewritten.sql, &opts.chain)?;
-        let sent = exact_numerics(&rewritten.sql, &columns).unwrap_or_else(|| rewritten.sql.clone());
+        let described = match columns(session, &rewritten.sql, &opts.chain) {
+            Err(Fail::Query(message)) => return Err(Fail::Query(with_columns(session, &rewritten.sql, &opts.chain, message))),
+            other => other?,
+        };
+        let (sent, columns) = exact(&rewritten.sql, &described);
+        let renamed: Vec<String> =
+            columns.iter().zip(&described).filter(|(new, old)| new.name != old.name).map(|(new, _)| format!("`{}`", new.name)).collect();
+        if !renamed.is_empty() {
+            note(&format!("result columns that shared a name were renamed: {}", renamed.join(", ")));
+        }
         (columns, sent)
     };
     let (rows, queued) = execute(session, &sent, opts, opts.limit, opts.offset, opts.timeout)?;
@@ -298,13 +339,26 @@ mod tests {
 
     #[test]
     fn numeric_columns_are_selected_as_text() {
-        let wrapped = exact_numerics("SELECT 1 -- x", &[col("tx", "bytea"), col("gas", "numeric"), col("to", "bytea")]).unwrap();
-        assert_eq!(wrapped, "SELECT _q.\"tx\", _q.\"gas\"::text AS \"gas\", _q.\"to\"\nFROM (\nSELECT 1 -- x\n) _q");
+        let (sent, columns) = exact("SELECT 1 -- x", &[col("tx", "bytea"), col("gas", "numeric"), col("to", "bytea")]);
+        assert_eq!(sent, "SELECT _q.\"tx\", _q.\"gas\"::text AS \"gas\", _q.\"to\"\nFROM (\nSELECT 1 -- x\n) _q");
+        assert_eq!(columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["tx", "gas", "to"]);
     }
 
     #[test]
-    fn queries_without_numerics_or_with_clashing_names_go_as_written() {
-        assert_eq!(exact_numerics("SELECT 1", &[col("n", "int8")]), None);
-        assert_eq!(exact_numerics("SELECT 1", &[col("gas", "numeric"), col("gas", "numeric")]), None);
+    fn a_query_without_numerics_goes_as_written() {
+        assert_eq!(exact("SELECT 1", &[col("n", "int8")]).0, "SELECT 1");
+    }
+
+    #[test]
+    fn columns_that_share_a_name_are_renamed() {
+        let described = [col("sel", "bytea"), col("max", "int8"), col("max", "numeric"), col("max_2", "int4"), col("", "text")];
+        let (sent, columns) = exact("SELECT 1", &described);
+        assert_eq!(
+            sent,
+            "SELECT _q.\"sel\", _q.\"max\", _q.\"max_2\"::text AS \"max_2\", _q.\"max_2_2\", _q.\"column_5\"\n\
+             FROM (\nSELECT 1\n) _q(\"sel\", \"max\", \"max_2\", \"max_2_2\", \"column_5\")"
+        );
+        assert_eq!(columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["sel", "max", "max_2", "max_2_2", "column_5"]);
+        assert_eq!(columns[2].ty, "numeric");
     }
 }

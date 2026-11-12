@@ -13,22 +13,23 @@ description: >
 # dedaub-monitoring
 
 Read-only queries over Dedaub's index of EVM chains. Rows print as TSV, exact and uncut.
-The tool stores no queries and creates no alerts.
 
 1. Check access once: `dedaub-monitoring status`. Exit code 3 means not logged in: say so and
    stop, a retry will not help.
-2. Start with a lookup. Each returns in seconds and decodes arguments with the ABI:
-   - `calls 0xCONTRACT [FUNCTION]`, `subcalls 0xCONTRACT`, `events 0xCONTRACT [EVENT]`
-   - `tx 0xHASH`, `replay 0xHASH`, `state 0xHASH`
-   - `code 0xCONTRACT` (source, or decompiled code when unverified; `--files` lists the
-     source files), `abi 0xCONTRACT`
-   - `contracts 'f(uint256)' …` (contracts with these functions, verified or not),
-     `contracts --name TEXT`, `--deployer 0xADDRESS`, `--same-code 0xCONTRACT`
+2. Start with a lookup. Each returns in seconds, with decoded arguments:
+   - `calls 0xCONTRACT [FUNCTION]`, `subcalls 0xCONTRACT`: `--failed`, `--top-level`,
+     `--tolerated`, `--returns`, `--tx` (the call's transaction); `--count-by function`
+     (or `caller`, `callee`, `status`) counts instead of listing
+   - `events 0xCONTRACT [EVENT]`, `tx 0xHASH`, `replay 0xHASH`, `state 0xHASH`
+   - `code 0xCONTRACT` (source, or decompiled code when unverified), `abi 0xCONTRACT`
+   - `contracts 'f(uint256)' …`, `--name TEXT`, `--deployer 0xADDRESS`, `--same-code 0xCONTRACT`
    - `sig NAME|0xSELECTOR|0xTOPIC0`, `schema [TABLE]`
 
-   `--help` on a lookup lists its filters, and `--show-sql` prints the SQL it ran.
-3. For any other question write SQL and run `dedaub-monitoring sql "SELECT …"`. Read
-   `dedaub-monitoring guide` first: tables, indexes, signature macros, worked examples.
+   `calls`, `subcalls` and `events` take `--last 30d --limit 20`. Over fifty rows, write them
+   to a file (`> rows.tsv`; notes stay on stderr) and work on the file.
+3. For any other question write SQL: `dedaub-monitoring sql "SELECT …"`. First read all of
+   `dedaub-monitoring guide` (100 lines). Its other pages: `guide contracts`, `guide tokens`,
+   `guide incidents`.
 
 ## Rules for SQL
 
@@ -38,13 +39,13 @@ The tool stores no queries and creates no alerts.
   window. A filter, sort or aggregate on a column outside the index reads the whole window:
   use two days or less.
 - Never join `transaction_detail` with `logs`, `outer_transaction`, `token_ledger` or itself.
-  The hash is `tx_hash(block_number, tx_index)` and the time `ts(block_number)`. For other
-  transaction fields, collect the rows in a materialized CTE ordered by
+  The hash is `tx_hash(block_number, tx_index)`, the time `block_timestamp(block_number)`.
+  For other transaction fields, collect the rows in a materialized CTE ordered by
   `(block_number, tx_index)`, then join `outer_transaction` on those two columns, with the
   same block bound on it.
 - Read arguments, results and events with the signature form of the macros, where each
   named argument is a column: `{{logs('0xCONTRACT.Transfer(address src, address dst, uint256 wad)')}}`.
 - Write addresses, selectors and topics bare (`0x…`, no quotes), and no chain prefix.
 
-Run the commands plainly, without sleep or retry loops: they wait in line by themselves for
-the account's three query slots. `--chain` takes a chain name or id; the default is ethereum.
+Run the commands plainly, without sleep or retry loops: they queue by themselves for the
+account's three query slots. `--chain` takes a chain name or id; the default is ethereum.
