@@ -264,58 +264,99 @@ fn iso_time(seconds: i64) -> String {
     format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z", rest / 3600, rest % 3600 / 60, rest % 60)
 }
 
-/// The search as SQL. The contracts are limited first, newest first; names are read after
-/// that, one key lookup per row that is output.
-fn search_sql(
-    selectors: &[[u8; 4]],
-    deployer: Option<&str>,
-    code_id: Option<&str>,
-    no_source: bool,
-    last: Option<&str>,
-    rows: u32,
-) -> String {
-    let mut conditions = Vec::new();
-    if !selectors.is_empty() {
-        let list: Vec<String> = selectors.iter().map(|s| sig::bytea(s)).collect();
-        conditions.push(format!("d.array_function_selectors @> ARRAY[{}]::selector4[]", list.join(", ")));
-    }
-    if let Some(deployer) = deployer {
-        conditions.push(format!("(c.eoa_deployer = {deployer} OR c.deployer = {deployer})"));
-    }
-    if let Some(code_id) = code_id {
-        conditions.push(format!("c.md5_bytecode = {code_id}"));
-    }
-    if no_source {
-        conditions.push("NOT EXISTS (SELECT 1 FROM code k WHERE k.md5_bytecode = c.md5_bytecode)".to_string());
-    }
-    if let Some(last) = last {
-        conditions.push(format!("c.block_number > get_historical_block_number('{last}')"));
-    }
-    // With functions, a contract must have decompiled code; without, it is only decoration.
-    let from = if selectors.is_empty() {
-        "contracts c\n    LEFT JOIN decompiled_code d USING (md5_bytecode)"
-    } else {
-        "decompiled_code d\n    JOIN contracts c USING (md5_bytecode)"
-    };
-    // No condition at all is the newest contracts.
-    let filter = if conditions.is_empty() { String::new() } else { format!("\n    WHERE {}", conditions.join("\n      AND ")) };
+/// Most bytecodes of one family that a search by code looks for. A family is the bytecodes that
+/// differ only in their constants. A proxy stub shares its family with every other such stub.
+const FAMILY_MAX: u64 = 2000;
+
+/// How many bytecodes differ from `code_id` only in their constants, itself included; counted
+/// up to one more than `FAMILY_MAX`.
+fn family_sql(code_id: &str) -> String {
     format!(
-        "SELECT r.address, r.block_number AS block, ts(r.block_number) AS time, tx_hash(r.block_number, r.tx_index) AS tx,\n       \
-         r.eoa_deployer AS deployer, r.deployer AS created_by,\n       \
-         (SELECT k.contract_name FROM code k WHERE k.md5_bytecode = r.md5_bytecode) AS name,\n       \
-         (SELECT p.protocol_name FROM protocol_contract pc JOIN protocol p USING (protocol_id)\n        \
-         WHERE pc.address = r.address LIMIT 1) AS protocol,\n       \
-         EXISTS (SELECT 1 FROM code k WHERE k.md5_bytecode = r.md5_bytecode) AS verified,\n       \
-         r.functions, r.md5_bytecode AS code, r.block_number_destroyed IS NOT NULL AS destroyed\n\
-         FROM (\n    \
-         SELECT c.address, c.block_number, c.tx_index, c.eoa_deployer, c.deployer, c.md5_bytecode, c.block_number_destroyed,\n           \
-         cardinality(d.array_function_selectors) AS functions\n    \
-         FROM {from}{filter}\n    \
-         ORDER BY c.block_number DESC\n    \
-         LIMIT {rows}\n\
-         ) r\n\
-         ORDER BY r.block_number DESC, r.address"
+        "SELECT count(*) AS bytecodes\nFROM (\n    SELECT 1\n    FROM normalised_md5 v\n    JOIN normalised_md5 m USING (normalised_md5)\n    \
+         WHERE v.md5_bytecode = {code_id}\n    LIMIT {}\n) f",
+        FAMILY_MAX + 1
     )
+}
+
+/// A search for contracts, newest first.
+#[derive(Clone, Default)]
+struct Search<'a> {
+    selectors: &'a [[u8; 4]],
+    deployer: Option<&'a str>,
+    /// A code id, and whether the bytecodes of its family count as well.
+    code: Option<(&'a str, bool)>,
+    no_source: bool,
+    last: Option<&'a str>,
+    /// The newest block to read, for the pages after the first.
+    until: Option<u64>,
+    rows: u32,
+}
+
+impl Search<'_> {
+    /// The search as SQL. The contracts are limited first, newest first; names are read after
+    /// that, one key lookup per row that is output.
+    fn sql(&self) -> String {
+        let Search { selectors, deployer, code, no_source, last, until, rows } = self.clone();
+        let mut conditions = Vec::new();
+        if !selectors.is_empty() {
+            let list: Vec<String> = selectors.iter().map(|s| sig::bytea(s)).collect();
+            conditions.push(format!("d.array_function_selectors @> ARRAY[{}]::selector4[]", list.join(", ")));
+        }
+        if let Some(deployer) = deployer {
+            conditions.push(format!("(c.eoa_deployer = {deployer} OR c.deployer = {deployer})"));
+        }
+        // The contracts of a family are read by bytecode, behind a fence, before anything is
+        // ordered. The family is an array, so that each bytecode is an index lookup; and
+        // without the fence the planner, asked for the newest of contracts it expects to be
+        // many, walks every contract in block order looking for them.
+        let contracts = match code {
+            Some((id, true)) => format!(
+                "(\n        SELECT k.*\n        FROM contracts k\n        \
+                 WHERE k.md5_bytecode = ANY (ARRAY[{id}] || ARRAY(\n            SELECT m.md5_bytecode::bytea\n            \
+                 FROM normalised_md5 v\n            JOIN normalised_md5 m USING (normalised_md5)\n            \
+                 WHERE v.md5_bytecode = {id}))\n        OFFSET 0\n    ) c"
+            ),
+            _ => "contracts c".to_string(),
+        };
+        if let Some((id, false)) = code {
+            conditions.push(format!("c.md5_bytecode = {id}"));
+        }
+        if no_source {
+            conditions.push("NOT EXISTS (SELECT 1 FROM code k WHERE k.md5_bytecode = c.md5_bytecode)".to_string());
+        }
+        if let Some(last) = last {
+            conditions.push(format!("c.block_number > get_historical_block_number('{last}')"));
+        }
+        if let Some(until) = until {
+            conditions.push(format!("c.block_number <= {until}"));
+        }
+        let same = code.map(|(id, _)| format!(", r.md5_bytecode = {id} AS same_bytecode")).unwrap_or_default();
+        // With functions, a contract must have decompiled code; without, it is only decoration.
+        let from = if selectors.is_empty() {
+            format!("{contracts}\n    LEFT JOIN decompiled_code d USING (md5_bytecode)")
+        } else {
+            format!("decompiled_code d\n    JOIN {contracts} USING (md5_bytecode)")
+        };
+        // No condition at all is the newest contracts.
+        let filter = if conditions.is_empty() { String::new() } else { format!("\n    WHERE {}", conditions.join("\n      AND ")) };
+        format!(
+            "SELECT r.address, r.block_number AS block, ts(r.block_number) AS time, tx_hash(r.block_number, r.tx_index) AS tx,\n       \
+             r.eoa_deployer AS deployer, r.deployer AS created_by,\n       \
+             (SELECT k.contract_name FROM code k WHERE k.md5_bytecode = r.md5_bytecode) AS name,\n       \
+             (SELECT p.protocol_name FROM protocol_contract pc JOIN protocol p USING (protocol_id)\n        \
+             WHERE pc.address = r.address LIMIT 1) AS protocol,\n       \
+             EXISTS (SELECT 1 FROM code k WHERE k.md5_bytecode = r.md5_bytecode) AS verified,\n       \
+             r.functions, r.md5_bytecode AS code{same}, r.block_number_destroyed IS NOT NULL AS destroyed\n\
+             FROM (\n    \
+             SELECT c.address, c.block_number, c.tx_index, c.eoa_deployer, c.deployer, c.md5_bytecode, c.block_number_destroyed,\n           \
+             cardinality(d.array_function_selectors) AS functions\n    \
+             FROM {from}{filter}\n    \
+             ORDER BY c.block_number DESC\n    \
+             LIMIT {rows}\n\
+             ) r\n\
+             ORDER BY r.block_number DESC, r.address"
+        )
+    }
 }
 
 /// Contracts by name, as the platform's own search ranks and names them.
@@ -371,15 +412,43 @@ pub fn search(session: &mut Session, args: &SearchArgs, opts: &QueryOpts) -> Res
             Some(id.ok_or_else(|| Fail::Query(format!("{contract} has no code on {}", opts.chain)))?)
         }
     };
-    let sql = search_sql(&selectors, deployer.as_deref(), code_id.as_deref(), args.no_source, last, opts.limit + opts.offset);
-    match run::query(session, &sql, opts) {
+    let code = match code_id.as_deref() {
+        None => None,
+        Some(id) => {
+            let probe = QueryOpts { limit: 1, offset: 0, show_sql: false, ..opts.clone() };
+            let counted = run::query(session, &family_sql(id), &probe)?.table;
+            let bytecodes = counted.rows.first().and_then(|row| row.first()).and_then(Value::as_u64).unwrap_or(0);
+            if bytecodes > FAMILY_MAX {
+                run::note(&format!(
+                    "more than {FAMILY_MAX} bytecodes differ from this one only in their constants, as for a proxy stub: \
+                     only the contracts with exactly this bytecode are listed"
+                ));
+            } else if bytecodes > 1 {
+                run::note(&format!(
+                    "{bytecodes} bytecodes differ only in their constants (immutables, embedded addresses): the contracts of \
+                     all of them are listed, and `same_bytecode` marks the exact copies"
+                ));
+            }
+            Some((id, bytecodes <= FAMILY_MAX))
+        }
+    };
+    let search = Search {
+        selectors: &selectors,
+        deployer: deployer.as_deref(),
+        code,
+        no_source: args.no_source,
+        last,
+        until: None,
+        rows: opts.limit + opts.offset,
+    };
+    match run::newest_first(session, opts, |until| Search { until, ..search.clone() }.sql()) {
         Err(Fail::Timeout(_)) if !selectors.is_empty() => Err(Fail::Timeout(format!(
             "no result after {} s; the search was revoked. Functions that few contracts have are found by reading every \
              decompiled contract, which is slow the first time: run it again, add --last 30d to look at new contracts only, \
-             or raise --timeout.",
+             or raise --timeout (your shell must then wait longer than that).",
             opts.timeout
         ))),
-        other => Ok(other?.table),
+        other => other,
     }
 }
 
@@ -472,7 +541,8 @@ mod tests {
 
     #[test]
     fn a_search_by_functions_starts_from_the_decompiled_code() {
-        let sql = search_sql(&[[0xa9, 0x05, 0x9c, 0xbb], [0x70, 0xa0, 0x82, 0x31]], None, None, true, Some("30d"), 20);
+        let selectors = [[0xa9, 0x05, 0x9c, 0xbb], [0x70, 0xa0, 0x82, 0x31]];
+        let sql = Search { selectors: &selectors, no_source: true, last: Some("30d"), rows: 20, ..Search::default() }.sql();
         assert!(sql.contains("FROM decompiled_code d\n    JOIN contracts c USING (md5_bytecode)"));
         assert!(sql.contains("d.array_function_selectors @> ARRAY['\\xa9059cbb'::bytea, '\\x70a08231'::bytea]::selector4[]"));
         assert!(sql.contains("AND NOT EXISTS (SELECT 1 FROM code k WHERE k.md5_bytecode = c.md5_bytecode)"));
@@ -483,13 +553,33 @@ mod tests {
     #[test]
     fn a_search_without_functions_starts_from_the_contracts() {
         let deployer = "0x4b8a782d4f03ffcb7ce1e95c5cfe5bfcb2c8e967";
-        let sql = search_sql(&[], Some(deployer), Some("0xb6d555d1194d3a5e0bfbba73eab269ec"), false, None, 5);
+        let code = "0xb6d555d1194d3a5e0bfbba73eab269ec";
+        let sql = Search { deployer: Some(deployer), code: Some((code, false)), rows: 5, ..Search::default() }.sql();
         assert!(sql.contains("FROM contracts c\n    LEFT JOIN decompiled_code d USING (md5_bytecode)"));
         assert!(sql.contains(&format!("WHERE (c.eoa_deployer = {deployer} OR c.deployer = {deployer})")));
         assert!(sql.contains("AND c.md5_bytecode = 0xb6d555d1194d3a5e0bfbba73eab269ec"));
         assert!(!sql.contains("get_historical_block_number"));
         // No condition at all is the newest contracts: the join is followed by the order, with no WHERE.
-        let newest = search_sql(&[], None, None, false, None, 5);
+        let newest = Search { rows: 5, ..Search::default() }.sql();
         assert!(newest.contains("LEFT JOIN decompiled_code d USING (md5_bytecode)\n    ORDER BY c.block_number DESC\n    LIMIT 5"));
+        assert!(!newest.contains("same_bytecode"));
+    }
+
+    #[test]
+    fn a_search_by_code_takes_the_bytecodes_that_differ_only_in_constants() {
+        let code = "0xb6d555d1194d3a5e0bfbba73eab269ec";
+        let family = Search { code: Some((code, true)), until: Some(26_000_000), rows: 5, ..Search::default() }.sql();
+        assert!(family.contains(&format!(
+            "FROM (\n        SELECT k.*\n        FROM contracts k\n        WHERE k.md5_bytecode = ANY (ARRAY[{code}] || ARRAY(\n            \
+             SELECT m.md5_bytecode::bytea"
+        )));
+        assert!(family.contains(&format!(
+            "WHERE v.md5_bytecode = {code}))\n        OFFSET 0\n    ) c\n    LEFT JOIN decompiled_code d USING (md5_bytecode)\n    \
+             WHERE c.block_number <= 26000000\n    ORDER BY c.block_number DESC"
+        )));
+        assert!(family.contains(&format!("r.md5_bytecode AS code, r.md5_bytecode = {code} AS same_bytecode, ")));
+        let exact = Search { code: Some((code, false)), rows: 5, ..Search::default() }.sql();
+        assert!(exact.contains(&format!("WHERE c.md5_bytecode = {code}\n    ORDER BY")));
+        assert!(family_sql(code).contains("LIMIT 2001\n) f"));
     }
 }

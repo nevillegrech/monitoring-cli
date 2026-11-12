@@ -222,23 +222,27 @@ pub fn events(session: &mut Session, args: &EventsArgs, opts: &QueryOpts) -> Res
         let topics: Vec<String> = topics_of(session, &emitter, event, opts)?.iter().map(|t| sig::bytea(t.as_slice())).collect();
         conditions.push(any_of("l.topic0", &topics));
     }
-    let sql = format!(
-        "SELECT tx_hash(r.block_number, r.tx_index) AS tx, r.block_number AS block, ts(r.block_number) AS time,\n       \
-         r.topic0, r.topic1, r.topic2, r.topic3, r.data{}\n\
-         FROM (\n    \
-         SELECT l.block_number, l.tx_index, l.log_index, l.topic0, l.topic1, l.topic2, l.topic3, l.data\n    \
-         FROM {{{{logs(duration='{}')}}}} l\n    \
-         WHERE {}\n    \
-         ORDER BY l.block_number DESC\n    \
-         LIMIT {}\n\
-         ) r\n\
-         ORDER BY r.block_number DESC, r.log_index DESC",
-        if args.with_tx { tx_info("r") } else { String::new() },
-        opts.last,
-        conditions.join("\n      AND "),
-        opts.limit + opts.offset,
-    );
-    let fetched = run::query(session, &sql, opts)?.table;
+    let sql = |until: Option<u64>| {
+        let mut conditions = conditions.clone();
+        conditions.extend(until.map(|block| format!("l.block_number <= {block}")));
+        format!(
+            "SELECT tx_hash(r.block_number, r.tx_index) AS tx, r.block_number AS block, ts(r.block_number) AS time,\n       \
+             r.topic0, r.topic1, r.topic2, r.topic3, r.data{}\n\
+             FROM (\n    \
+             SELECT l.block_number, l.tx_index, l.log_index, l.topic0, l.topic1, l.topic2, l.topic3, l.data\n    \
+             FROM {{{{logs(duration='{}')}}}} l\n    \
+             WHERE {}\n    \
+             ORDER BY l.block_number DESC\n    \
+             LIMIT {}\n\
+             ) r\n\
+             ORDER BY r.block_number DESC, r.log_index DESC",
+            if args.with_tx { tx_info("r") } else { String::new() },
+            opts.last,
+            conditions.join("\n      AND "),
+            opts.limit + opts.offset,
+        )
+    };
+    let fetched = run::newest_first(session, opts, sql)?;
     if args.raw {
         return Ok(fetched);
     }

@@ -14,8 +14,11 @@ use crate::rewrite::{self, Abis, EventUse, Rewritten};
 use crate::sig::{self, EventAbi};
 use crate::slots;
 
-/// The server's cap on `limit`.
+/// The server's cap on `limit`: the most rows one request returns.
 pub const MAX_LIMIT: u32 = 500;
+
+/// The most rows `--limit` takes. Above `MAX_LIMIT` they come in pages, one run of the query each.
+pub const MAX_ROWS: u32 = 5000;
 
 #[derive(Clone, Debug)]
 pub struct QueryOpts {
@@ -234,7 +237,8 @@ fn execute(session: &mut Session, sql: &str, opts: &QueryOpts, limit: u32, offse
                 "no result after {timeout} s; the query was revoked. Shorten the window first: `duration='2d'` in a macro, \
                  `block_number > get_historical_block_number('2 day')` on a bare table, `--last 2d` on a lookup. A filter, \
                  sort or aggregate reads every row of the window, and a join needs the bound on both tables. \
-                 `dedaub-monitoring guide` has the rules; --timeout raises the limit."
+                 `dedaub-monitoring guide` has the rules. --timeout raises the limit, but your shell must then wait \
+                 longer than that for the command: many stop at 120 s."
             )));
         }
         pause = (pause * 3 / 2).min(Duration::from_secs(1));
@@ -261,7 +265,20 @@ pub fn run(session: &mut Session, rewritten: &Rewritten, opts: &QueryOpts) -> Re
         }
         (columns, sent)
     };
-    let (rows, queued) = execute(session, &sent, opts, opts.limit, opts.offset, opts.timeout)?;
+    // One request returns at most `MAX_LIMIT` rows: more are fetched page by page.
+    let mut rows = Vec::new();
+    let mut queued = 0.0;
+    while (rows.len() as u32) < opts.limit {
+        let fetched = rows.len() as u32;
+        let wanted = (opts.limit - fetched).min(MAX_LIMIT);
+        let (page, waited) = execute(session, &sent, opts, wanted, opts.offset + fetched, opts.timeout)?;
+        queued += waited;
+        let full = page.len() as u32 == wanted;
+        rows.extend(page);
+        if !full {
+            break;
+        }
+    }
     let table = Table::from_objects(columns, rows);
     if table.rows.is_empty() && opts.offset == 0 {
         for event in rewritten.events.iter().take(2) {
@@ -276,6 +293,30 @@ pub fn run(session: &mut Session, rewritten: &Rewritten, opts: &QueryOpts) -> Re
 pub fn query(session: &mut Session, sql: &str, opts: &QueryOpts) -> Res<Outcome> {
     let rewritten = prepare(session, sql, opts)?;
     run(session, &rewritten, opts)
+}
+
+/// A lookup that lists rows newest first, with a column `block`. `sql` writes the query, given
+/// a block it must not read past. Beyond one page each page is a run of the query, and rows
+/// that arrive between two runs would shift the later page: so every page after the first is
+/// bounded by the newest block of the first.
+pub fn newest_first(session: &mut Session, opts: &QueryOpts, sql: impl Fn(Option<u64>) -> String) -> Res<Table> {
+    let first = QueryOpts { limit: opts.limit.min(MAX_LIMIT), ..opts.clone() };
+    let mut table = query(session, &sql(None), &first)?.table;
+    let newest = table.columns.iter().position(|c| c.name == "block").and_then(|i| table.rows.first()?.get(i)?.as_u64());
+    let Some(newest) = newest.filter(|_| table.rows.len() as u32 == MAX_LIMIT) else { return Ok(table) };
+    let bounded = sql(Some(newest));
+    while (table.rows.len() as u32) < opts.limit {
+        let fetched = table.rows.len() as u32;
+        let page =
+            QueryOpts { limit: (opts.limit - fetched).min(MAX_LIMIT), offset: opts.offset + fetched, show_sql: false, ..opts.clone() };
+        let more = query(session, &bounded, &page)?.table;
+        let full = more.rows.len() as u32 == page.limit;
+        table.rows.extend(more.rows);
+        if !full {
+            break;
+        }
+    }
+    Ok(table)
 }
 
 /// Why did a query over an event return nothing? Look at one log with the event's topic0: the
@@ -322,8 +363,13 @@ pub fn summary(outcome: &Outcome, opts: &QueryOpts) -> String {
     }
     if rows as u32 == opts.limit {
         text.push_str(&format!(
-            " (the limit: there may be more; --limit goes up to {MAX_LIMIT}, --offset {} gives the next page)",
+            " (the limit: there may be more; --limit goes up to {MAX_ROWS}, --offset {} gives the next page)",
             opts.offset + opts.limit
+        ));
+    }
+    if rows as u32 > MAX_LIMIT {
+        text.push_str(&format!(
+            "\n# fetched {MAX_LIMIT} rows at a time, each a run of the query: the pages line up only if its ORDER BY fixes the order of every row"
         ));
     }
     text

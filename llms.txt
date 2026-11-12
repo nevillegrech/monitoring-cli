@@ -13,7 +13,7 @@
 ## Key commands
 
 - `status` — check the login; exit 0 when queries can run, 3 when not
-- `guide` — the query guide: tables, indexes, helpers, and the rules for fast queries; more pages with `guide contracts`, `guide tokens`, `guide incidents`
+- `guide` — the query guide: tables, indexes, helpers, and the rules for fast queries; more pages with `guide contracts`, `guide tokens`, `guide incidents`, `guide old-data` (questions about compressed blocks)
 - `calls 0xCONTRACT [FUNCTION]` — calls to a contract: caller, gas given and used, status, arguments
 - `subcalls 0xCONTRACT` — calls a contract makes, and whether its function went on when one failed
 - `calls`/`subcalls … --count-by function|caller|callee|status` — the calls counted, with the gas they were given and used
@@ -25,6 +25,7 @@
 - `code 0xCONTRACT` — verified source of a contract, or its decompiled code when it has none
 - `contracts [FUNCTION]…` — contracts that have these functions, verified or not; or by `--name`, `--deployer`, `--same-code`
 - `schema [TABLE]` — tables, columns, indexes
+- `coverage` — the blocks each history table holds, the block its uncompressed rows begin at, what is indexed in either part, and which columns compressed rows can be skipped by; also the range of `address_selector` (transactions by the selectors and addresses they involve)
 - `sql "SELECT …"` — run a query; `expand` and `explain` show the expanded SQL and the plan
 - `login`, `logout`, `token` — browser login, and the token for machines without a browser
 - `install-skill` — install the agent skill

@@ -3,7 +3,7 @@
 The on-chain history of EVM chains in PostgreSQL: every call frame, event and transaction, token balances, transfers and allowances, and every contract with its source or decompiled code.
 `--chain` picks the chain (a name or an id, default `ethereum`), so no table, macro or function takes a chain prefix.
 
-This page: the lookups, `sql` with its tables and helpers, and the rules that keep a query fast. Three more pages: `guide contracts` (code, proxies), `guide tokens` (balances, transfers, allowances, USD), `guide incidents` (who lost what, who else runs the code, where the money went).
+This page: the lookups, `sql` with its tables and helpers, and the rules that keep a query fast. Four more pages: `guide contracts` (code, proxies), `guide tokens` (balances, transfers, allowances, USD), `guide incidents` (who lost what, who else runs the code, where the money went), `guide old-data` (questions about blocks older than a few months).
 
 ## Start with a lookup
 
@@ -22,12 +22,13 @@ A lookup writes its SQL in a shape that returns in seconds, and decodes the rows
 | What is this contract's code, verified or not? | `code 0xCONTRACT` |
 | Which contracts have these functions, this deployer, this code, this name? | `contracts 'f(uint256)' …`, `contracts --name TEXT` |
 | Which tables and columns exist? | `schema`, `schema logs` |
+| Which blocks does each table hold, from where are they uncompressed, what is indexed? | `coverage` |
 
 - `FUNCTION` is a name from the contract's ABI, a signature, or a selector. `EVENT` is a name, a signature, or a topic0.
 - `calls` and `subcalls` take `--failed`, `--returns` (outputs, or the revert reason of a failed call) and `--tx` (sender, gas limit, gas used and status of the call's transaction). `calls` also takes `--top-level` and `--from 0xCALLER`; `subcalls` takes `--to 0xCALLEE` and `--tolerated` (the call failed and the function that made it went on).
 - `--count-by KEY` counts the calls instead of listing them: per `function`, `caller` (`callee` for `subcalls`) or `status`, or several (`function,status`), with the failures, the least and most gas given, the most gas used, and the first and last time.
-- The filters and the counts look at the newest 20,000 calls of the window (`--scan N` for more); a note says how far back that reached.
-- `calls`, `subcalls` and `events` take `--last 30d`, `--limit 20`, `--offset N` and `--max-cell N` (0 = no cut). Every lookup takes `--format tsv|json|csv`, and `--show-sql`, which prints the SQL it ran: a starting point for your own.
+- The filters and the counts look at the newest 20,000 calls of the window (`--scan N` for more); a note says how far back that reached. `subcalls --to` is no filter: it reads the calls of that pair, over any window.
+- `calls`, `subcalls` and `events` take `--last 30d`, `--limit 20` (up to 5000), `--offset N` and `--max-cell N` (0 = no cut). Every lookup takes `--format tsv|json|csv`, and `--show-sql`, which prints the SQL it ran: a starting point for your own.
 - For more than fifty rows, write the result to a file and work on that: `calls 0xCONTRACT --limit 500 > calls.tsv` (notes and the row count stay on stderr).
 
 ## sql
@@ -36,16 +37,16 @@ A lookup writes its SQL in a shape that returns in seconds, and decodes the rows
 dedaub-monitoring sql "SELECT …"        # or --file q.sql, or the SQL on stdin
 ```
 
-Rows go to stdout (TSV with a header line; NULL prints as `null`), notes and the row count to stderr. Numbers are exact, bytes print as `0x…`, nothing is cut. `--limit` is 100 by default and at most 500; `--offset` pages. An account runs 3 queries at a time: further commands wait in line (`--wait`, 600 s), so do not wrap them in retry loops. A query that runs past `--timeout` (100 s) is revoked.
+Rows go to stdout (TSV with a header line; NULL prints as `null`), notes and the row count to stderr. Numbers are exact, bytes print as `0x…`, nothing is cut. `--limit` is 100 by default; above 500 the query runs once per 500 rows (5000 at most), so its `ORDER BY` must fix the order of every row. `--offset` pages. An account runs 3 queries at a time: further commands wait in line (`--wait`, 600 s), so do not wrap them in retry loops. A query that runs past `--timeout` (100 s) is revoked.
 
 ### Tables
 
 Three tables hold the history. A macro reads one of them with a block bound: `{{transaction_detail(duration='2d')}}`; without `duration` it takes `--last` (24h). A bare table name has no bound: give it one (rule 1), or constants on its primary key.
 
-| Table | One row per | Columns | Indexes |
+| Table | One row per | Columns | Indexes (uncompressed blocks, rule 7) |
 |---|---|---|---|
 | `transaction_detail` | call frame, internal calls included | `block_number`, `tx_index`, `vm_step_start` (the key; step 0 is the transaction's own call), `from_a` (caller), `to_a` (callee), `calldata`, `returndata`, `callvalue`, `gas` (given to the frame; at step 0 the transaction's gas limit), `gas_used`, `error` (NULL, `ErrOutOfGas`, `ErrExecutionReverted`, …), `committed` (false: undone by a revert, its own or one above it), `call_opcode` (`CALL`, `DELEGATECALL`, `STATICCALL`, `CREATE`, `CREATE2`), `caller_vm_step_stack` (the steps of the frames above, nearest first; its `cardinality` is the depth) | `(to_a, selector(calldata), block_number)`, `(to_a, block_number)`, `(from_a, block_number)`, `(selector(calldata), block_number)`, the key |
-| `logs` | event | `block_number`, `tx_index`, `log_index`, `address` (emitter), `topic0`…`topic3`, `data`, `committed` | `(address, block_number)`, `(topic0, block_number)` |
+| `logs` | event | `block_number`, `tx_index`, `log_index`, `address` (emitter), `topic0`…`topic3`, `data`, `committed` | `(address, block_number)`; `(topic0, block_number)` on Ethereum and Arbitrum only (`coverage` lists a chain's indexes) |
 | `outer_transaction` | transaction | `block_number`, `tx_index` (the key), `tx_hash`, `from_a`, `to_a`, `status`, `gas` (limit), `gas_used`, `gas_price`, `callvalue`, `nonce`, `tx_type`. No calldata: a transaction's input is the `calldata` of its frame at step 0 | the key, `(tx_hash)`, `(from_a)`; none on `to_a` |
 
 The macros return committed rows only. A failed call is not committed: write `only_committed=False` to see it. A bare table returns both kinds. Another table: `block` (`block_number`, `ts`, `gas_limit`, `base_fee_per_gas`). `schema NAME` shows any table.
@@ -85,16 +86,16 @@ For the frame that made a call (`caller_vm_step_stack[1]` is its step), limit yo
 
 **5. Transactions sent to a contract are its frames at `vm_step_start = 0`.** `outer_transaction` has no index on `to_a`: a condition on it reads every transaction of the window, 16 s over two days and a timeout over 30. The frames have the index, and `calls --top-level` reads them.
 
-**6. One transaction is read by its position.** `tx 0xHASH` does it. In SQL, the hash has its own index in `outer_transaction`: `WHERE (d.block_number, d.tx_index) = (SELECT o.block_number, o.tx_index FROM outer_transaction o WHERE o.tx_hash = 0x…)`. That takes 2 s for a transaction's rows in `token_ledger` and 7 to 30 s for its frames, as the database learns the block only while it runs; with the two numbers written out as constants the frames take 1 to 3 s.
+**6. One transaction is read by its position.** `tx 0xHASH` does it. In SQL, the hash has its own index in `outer_transaction`: `WHERE (d.block_number, d.tx_index) = (SELECT o.block_number, o.tx_index FROM outer_transaction o WHERE o.tx_hash = 0x…)`. That takes 2 s for a transaction's rows in `token_ledger` and 7 to 30 s for its frames, as the database learns the block only while it runs; with the two numbers written out as constants the frames take 1 to 3 s. In compressed blocks (rule 7) they take 20 s or more either way.
 
-**7. Rows older than about three months are stored by contract.** Older chunks are compressed: grouped by `to_a` (frames) or by `address` (logs, `token_ledger`) and ordered by block. So `calls 0xCONTRACT --last 365d` still takes seconds, while a read by block or transaction alone scans whole chunks and times out. `tx` then reads the platform's trace, which lacks the gas each frame was given. The ledger's plain rows go back five months or more; `outer_transaction` is not compressed.
+**7. Only the last 15 days are sure to be uncompressed, and in older blocks a query needs the contract.** Older blocks are compressed sooner or later, on Ethereum three to six months back when read. Compressed rows are stored by contract and then by block (`to_a` for frames, `address` for logs and `token_ledger`), so `calls 0xCONTRACT --last 365d` still takes seconds, while a read by caller, selector, topic, token or transaction reads far more there and mostly times out. `dedaub-monitoring coverage` shows where each table's compressed blocks begin on the chain and what leads to rows in them; `guide old-data` says how to ask those questions over old blocks.
 
 **8. Give the planner a small set as an array**: `WHERE c.md5_bytecode = ANY (ARRAY(SELECT …))`. The planner expects thousands of contracts for one bytecode and of proxies for one implementation, so for a join it may scan a table of 60 million rows. The second query of `guide incidents` went from a timeout to 3 s that way.
 
 ### When a query fails
 
 - Exit codes: 0 rows printed (possibly none), 1 the server refused or failed the SQL, 2 bad arguments, 3 not logged in, 4 the query slots stayed busy for `--wait`, 5 revoked after `--timeout`.
-- After a timeout, shorten the window (rule 3) and check the joins (rule 4) before raising `--timeout`. `explain "SQL"` prints the plan without running the query: dozens of `_hyper_…_chunk` scans mean a table without a block bound. `expand "SQL"` prints the SQL as the database receives it.
+- After a timeout, shorten the window (rules 3 and 7) and check the joins (rule 4) before raising `--timeout`: your shell must wait longer than that, and many stop a command at 120 s. `explain "SQL"` prints the plan without running the query: dozens of chunk scans mean a table without a block bound. `expand "SQL"` prints the SQL as the database receives it.
 - A column that does not exist is answered with the columns the table has. Result columns that share a name are renamed (`max`, `max_2`).
 - `status` checks the login and shows how many query slots are in use.
 

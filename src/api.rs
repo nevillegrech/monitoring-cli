@@ -21,8 +21,11 @@ use crate::error::{Fail, NOT_LOGGED_IN, Res};
 
 /// Refresh the access token this long before it expires, so no request leaves with a dying one.
 const EXPIRY_MARGIN: u64 = 30;
-const GET_ATTEMPTS: u32 = 3;
+/// How often a request that only reads is sent before its failure is reported.
+const READ_ATTEMPTS: u32 = 3;
 const RETRY_STATUSES: [u16; 4] = [408, 502, 503, 504];
+/// The endpoints that compile SQL without running it: a POST that changes nothing.
+const COMPILE_PATHS: [&str; 3] = ["/api/tsql/query/metadata", "/api/tsql/query/preview", "/api/tsql/query/explain"];
 /// A query id pinned from outside, for a sandbox that cannot write the state directory.
 pub const QUERY_ID_ENV: &str = "DEDAUB_MONITORING_QUERY_ID";
 /// The API runs SQL only in the context of a stored query. This tool keeps one, and never
@@ -57,7 +60,7 @@ pub struct Session {
     pub interrupted: Arc<AtomicBool>,
 }
 
-fn now() -> u64 {
+pub fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
@@ -204,7 +207,7 @@ impl Session {
         body: Option<&Value>,
         timeout: Duration,
     ) -> Res<Reply> {
-        let attempts = if method == Method::GET { GET_ATTEMPTS } else { 1 };
+        let attempts = if method == Method::GET || COMPILE_PATHS.contains(&path) { READ_ATTEMPTS } else { 1 };
         let mut reauthenticated = false;
         let mut attempt = 0;
         loop {
@@ -234,7 +237,9 @@ impl Session {
                         self.write_state();
                         continue;
                     }
-                    if last || !RETRY_STATUSES.contains(&status) {
+                    // A plain 500 is tried once more: it may be the request's own fault.
+                    let again = RETRY_STATUSES.contains(&status) || (status == 500 && attempt == 1);
+                    if last || !again {
                         let text = response.text().map_err(|e| Fail::Other(format!("reading {path}: {e}")))?;
                         return Ok(Reply { status, text });
                     }

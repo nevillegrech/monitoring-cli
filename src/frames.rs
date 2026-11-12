@@ -1,7 +1,7 @@
 //! Call frames of `transaction_detail`: calls to a contract and calls made by one.
 //!
 //! One index scan, newest first, picks the rows. A filter on a column outside that index
-//! (failed, top-level, the other party) runs over the newest `--scan` rows of the window, so
+//! (failed, top-level, the caller) runs over the newest `--scan` rows of the window, so
 //! that a rare match on a busy contract cannot read all of a long window. Columns of other
 //! rows (the transaction, the calling frame) are read by primary key for the rows that are
 //! kept: at most 500 lookups, whatever the planner would make of a join.
@@ -12,7 +12,8 @@ use alloy_json_abi::Function;
 use alloy_primitives::hex;
 use serde_json::{Value, json};
 
-use crate::api::Session;
+use crate::api::{self, Session};
+use crate::coverage;
 use crate::error::{Fail, Res};
 use crate::lookups::{self, ContractAbi, any_of, bytes_cell, cell, frame_status};
 use crate::output::Table;
@@ -24,7 +25,8 @@ use crate::sig;
 pub enum Side {
     /// Calls to a contract: the `(to_a, selector, block_number)` index.
     To,
-    /// Calls made by a contract: the `(from_a, block_number)` index.
+    /// Calls made by a contract: the `(from_a, block_number)` index. Compressed blocks have
+    /// none on the caller: they are stored by callee, and read by it when one is given.
     From,
 }
 
@@ -115,15 +117,21 @@ const FRAME_COLUMNS: &str = "d.block_number, d.tx_index, d.vm_step_start, d.from
 const COUNT_COLUMNS: &str = "d.block_number, d.vm_step_start, d.from_a, d.to_a, d.call_opcode, d.gas, d.gas_used, d.error, d.committed,\n           \
                              selector(d.calldata) AS sel";
 
+#[derive(Clone)]
 struct FrameQuery {
     last: String,
     /// Conditions the leading index answers.
     indexed: Vec<String>,
+    /// The newest block to read, for the pages after the first.
+    until: Option<u64>,
     /// Conditions on other columns, written over the alias `s`.
     filters: Vec<String>,
     returns: bool,
     with_tx: bool,
     with_parent: bool,
+    /// The contracts whose code most likely made the calls: the calling frame is looked for
+    /// under them first.
+    parent_in: Vec<String>,
     tolerated: bool,
     scan: u32,
     rows: u32,
@@ -138,20 +146,33 @@ impl FrameQuery {
     /// subquery on the primary key, through the macro: the macro's block bound keeps each
     /// lookup inside the window's chunks, and a subquery runs once per row. Written as a join
     /// (LATERAL included), the planner hashes every frame of the window.
+    ///
+    /// Compressed blocks have no index on the key: a frame is found there through the contract
+    /// it ran in, and by its position alone only with a scan of its blocks. So the frame is
+    /// looked for under `parent_in` first, and by position alone only if it is not there (the
+    /// call was made by a library or by an earlier implementation).
     fn parent(&self) -> String {
-        format!(
-            ",\n               (SELECT jsonb_build_object('selector', encode(substring(q.calldata FROM 1 FOR 4), 'hex'), 'error', q.error, 'committed', q.committed)\n                \
-             FROM {{{{transaction_detail(duration='{}', only_committed=False)}}}} q\n                \
-             WHERE q.block_number = r.block_number AND q.tx_index = r.tx_index\n                  \
-             AND q.vm_step_start = r.caller_vm_step_stack[1]) AS parent",
-            self.last
-        )
+        let frame = |within: &str| {
+            format!(
+                "(SELECT jsonb_build_object('selector', encode(substring(q.calldata FROM 1 FOR 4), 'hex'), 'error', q.error, 'committed', q.committed)\n                \
+                 FROM {{{{transaction_detail(duration='{}', only_committed=False)}}}} q\n                \
+                 WHERE {within}q.block_number = r.block_number AND q.tx_index = r.tx_index\n                  \
+                 AND q.vm_step_start = r.caller_vm_step_stack[1])",
+                self.last
+            )
+        };
+        if self.parent_in.is_empty() {
+            return format!(",\n               {} AS parent", frame(""));
+        }
+        let within = format!("q.to_a = ANY (ARRAY[{}]) AND ", self.parent_in.join(", "));
+        format!(",\n               COALESCE(\n               {},\n               {}) AS parent", frame(&within), frame(""))
     }
 
     /// The newest `limit` calls that the index leads to.
     fn newest(&self, columns: &str, limit: u32) -> String {
+        let until = self.until.map(|block| format!("\n      AND d.block_number <= {block}")).unwrap_or_default();
         format!(
-            "SELECT {columns}\n    FROM {}\n    WHERE {}\n    ORDER BY d.block_number DESC\n    LIMIT {limit}",
+            "SELECT {columns}\n    FROM {}\n    WHERE {}{until}\n    ORDER BY d.block_number DESC\n    LIMIT {limit}",
             self.source(),
             self.indexed.join("\n      AND ")
         )
@@ -285,8 +306,14 @@ fn function_names(selectors: &[[u8; 4]], known: impl Fn(&[u8; 4]) -> Option<Stri
 /// The calls of the sample counted per key, with the gas they were given and used.
 fn counts(session: &mut Session, side: Side, abi: &ContractAbi, query: &FrameQuery, keys: &[By], opts: &QueryOpts) -> Res<Table> {
     let fetched = run::query(session, &query.count_sql(keys), opts)?.table;
+    // When every group is shown and together they hold fewer calls than the sample takes, the
+    // sample was the whole window: there is no end to look for.
+    let counted: u64 = fetched.rows.iter().filter_map(|row| cell(&fetched, row, "calls").as_u64()).sum();
+    let whole = query.filters.is_empty() && (fetched.rows.len() as u32) < opts.limit && counted < u64::from(query.scan);
     let probe = QueryOpts { limit: 1, offset: 0, show_sql: false, ..opts.clone() };
-    if let Some(end) = run::query(session, &query.sample_end(), &probe).ok().and_then(|o| o.table.rows.into_iter().next()) {
+    let end =
+        if whole { None } else { run::query(session, &query.sample_end(), &probe).ok().and_then(|o| o.table.rows.into_iter().next()) };
+    if let Some(end) = end {
         run::note(&format!(
             "counted over the newest {} calls only, back to block {} ({}); --scan N counts further back",
             query.scan,
@@ -350,9 +377,31 @@ pub fn calls(session: &mut Session, args: &CallsArgs, opts: &QueryOpts) -> Res<T
         }
         Side::From => {
             indexed.push(format!("d.from_a = {lead}"));
-            filters.extend(other.map(|callee| format!("s.to_a = {callee}")));
+            indexed.extend(other.map(|callee| format!("d.to_a = {callee}")));
         }
     }
+    // By caller alone, a window that reaches compressed blocks reads all of them.
+    let by_caller = (args.side == Side::From && args.other.is_none())
+        .then(|| coverage::compressed_reach(&opts.chain, "transaction_detail", &opts.last, api::now() as i64))
+        .flatten()
+        .map(|from| {
+            format!(
+                "calls are found by their caller only in the uncompressed blocks, which began at block {} ({}) when read on {}. \
+                 Older blocks are stored by callee: over `--last {}` give --to 0xCALLEE, or shorten --last \
+                 (`dedaub-monitoring coverage` shows the ranges, `guide old-data` the ways to ask)",
+                from.block,
+                from.day,
+                coverage::read_on(),
+                opts.last
+            )
+        });
+    if let Some(text) = &by_caller {
+        run::note(text);
+    }
+    let hinted = |result: Res<Table>| match (result, &by_caller) {
+        (Err(Fail::Timeout(message)), Some(text)) => Err(Fail::Timeout(format!("{message}\nHere, {text}."))),
+        (result, _) => result,
+    };
     if args.failed || args.tolerated {
         filters.push("s.error IS NOT NULL".to_string());
     }
@@ -363,18 +412,21 @@ pub fn calls(session: &mut Session, args: &CallsArgs, opts: &QueryOpts) -> Res<T
     let query = FrameQuery {
         last: opts.last.clone(),
         indexed,
+        until: None,
         filters,
         returns: args.returns,
         with_tx: args.with_tx,
         with_parent: args.side == Side::From,
+        // A call is made by the contract's own code, or behind a proxy by its implementation's.
+        parent_in: std::iter::once(lead.clone()).chain(abi.implementation.clone()).collect(),
         tolerated: args.tolerated,
         scan: args.scan.max(rows),
         rows,
     };
     if !count_by.is_empty() {
-        return counts(session, args.side, &abi, &query, &count_by, opts);
+        return hinted(counts(session, args.side, &abi, &query, &count_by, opts));
     }
-    let fetched = run::query(session, &query.sql(), opts)?.table;
+    let fetched = hinted(run::newest_first(session, opts, |until| FrameQuery { until, ..query.clone() }.sql()))?;
     if !query.filters.is_empty() && (fetched.rows.len() as u32) < opts.limit {
         // Fewer rows than asked for: say whether the whole window was searched.
         let probe = QueryOpts { limit: 1, offset: 0, show_sql: false, ..opts.clone() };
@@ -474,10 +526,12 @@ mod tests {
         FrameQuery {
             last: "30d".to_string(),
             indexed: vec!["d.to_a = 0x00000000000000000000000000000000000000aa".to_string()],
+            until: None,
             filters: Vec::new(),
             returns: false,
             with_tx: false,
             with_parent: false,
+            parent_in: Vec::new(),
             tolerated: false,
             scan: 20000,
             rows: 20,
@@ -491,6 +545,15 @@ mod tests {
         assert!(!sql.contains("JOIN"));
         assert!(!sql.contains(") s"));
         assert!(!sql.contains("jsonb_build_object"));
+    }
+
+    #[test]
+    fn pages_after_the_first_stop_at_its_newest_block() {
+        let sql = FrameQuery { until: Some(26_000_000), ..query() }.sql();
+        assert!(sql.contains(
+            "WHERE d.to_a = 0x00000000000000000000000000000000000000aa\n          AND d.block_number <= 26000000\n        \
+             ORDER BY d.block_number DESC\n        LIMIT 20"
+        ));
     }
 
     #[test]
@@ -513,6 +576,20 @@ mod tests {
         assert!(sql.contains("LIMIT 500\n    ) r\n    OFFSET 0\n) x\nWHERE x.parent->>'error' IS NULL\nLIMIT 20"));
         assert!(!sql.contains("JOIN"));
         assert!(!sql.contains("ORDER BY x."));
+    }
+
+    #[test]
+    fn the_calling_frame_is_looked_for_under_the_contract_first() {
+        let lead = "0x00000000000000000000000000000000000000bb";
+        let implementation = "0x00000000000000000000000000000000000000cc";
+        let sql = FrameQuery { with_parent: true, parent_in: vec![lead.to_string(), implementation.to_string()], ..query() }.sql();
+        assert!(sql.contains("COALESCE(\n               (SELECT jsonb_build_object('selector', "));
+        assert!(sql.contains(&format!(
+            "WHERE q.to_a = ANY (ARRAY[{lead}, {implementation}]) AND q.block_number = r.block_number AND q.tx_index = r.tx_index\n"
+        )));
+        // The second lookup is by position alone.
+        assert!(sql.contains("q\n                WHERE q.block_number = r.block_number AND q.tx_index = r.tx_index\n"));
+        assert!(sql.contains("AND q.vm_step_start = r.caller_vm_step_stack[1])) AS parent"));
     }
 
     #[test]

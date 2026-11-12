@@ -54,8 +54,9 @@ A lookup writes its own SQL, in a shape that returns in seconds, and decodes the
 | `state 0xHASH` | the storage slots, balances, nonces and code it changed |
 | `abi 0xCONTRACT`, `sig NAME` | a contract's functions; a function or event by name, selector or topic0 |
 | `code 0xCONTRACT` | a contract's verified source, or its decompiled code when it has none |
-| `contracts [FUNCTION]…` | contracts that have these functions, verified or not; or by `--name`, `--deployer`, `--same-code` |
+| `contracts [FUNCTION]…` | contracts that have these functions, verified or not; or by `--name`, `--deployer`, `--same-code` (the bytecode, or one that differs only in constants) |
 | `schema [TABLE]` | tables, columns and indexes |
+| `coverage` | the blocks each history table holds, the block its uncompressed rows begin at, what is indexed in either part, and which columns compressed rows can be skipped by |
 
 ```sh
 dedaub-monitoring calls 0x7c7fdfca295a787ded12bb5c1a49a8d2cc20e3f8 transmit --tx --limit 5
@@ -83,7 +84,7 @@ ORDER BY d.block_number DESC
 LIMIT 20"
 ```
 
-The SQL also comes from `--file` or stdin. `dedaub-monitoring guide` prints the query guide: the tables and their indexes, the helpers, and the rules that keep a query fast: a block bound on every table, short windows for filters and aggregates, no joins into `transaction_detail`. Read it before writing SQL. It has three more pages: `guide contracts` (code and proxies), `guide tokens` (balances, transfers, allowances, USD) and `guide incidents` (who lost what, who else runs the code, where the money went).
+The SQL also comes from `--file` or stdin. `dedaub-monitoring guide` prints the query guide: the tables and their indexes, the helpers, and the rules that keep a query fast: a block bound on every table, short windows for filters and aggregates, no joins into `transaction_detail`. Read it before writing SQL. It has four more pages: `guide contracts` (code and proxies), `guide tokens` (balances, transfers, allowances, USD), `guide incidents` (who lost what, who else runs the code, where the money went) and `guide old-data` (how to ask by caller, selector, topic, token or transaction over compressed blocks).
 
 Before the SQL is sent, the tool makes these changes (`--show-sql` prints the result, `--raw` turns them off):
 
@@ -100,7 +101,10 @@ Output is TSV by default, `--format json` gives one object per row, `--format cs
 ## Behaviour to rely on
 
 - **Queueing.** An account runs three queries at a time. Commands on one machine share three slots through lock files, and wait up to `--wait` seconds (600) for a slot or for the server to accept the query. Do not wrap commands in retry loops.
-- **Timeouts.** A query that runs past `--timeout` (100 s) is revoked on the server, as is a query interrupted with Ctrl-C. The default is under the 120 s after which an agent's shell gives up on a command, so the advice printed on a timeout is seen.
+- **Timeouts.** A query that runs past `--timeout` (100 s) is revoked on the server, as is a query interrupted with Ctrl-C. The default is under the 120 s after which an agent's shell gives up on a command, so the advice printed on a timeout is seen; a higher `--timeout` needs a shell that waits longer.
+- **Rows.** One request returns at most 500 rows. A higher `--limit` (up to 5000) is fetched in pages, each a run of the query. The lookups bound the later pages by the newest block of the first, so that rows arriving in between do not shift them; for `sql`, the `ORDER BY` must fix the order of every row.
+- **Compressed blocks.** At least the last 15 days of each history table are stored uncompressed, with every index. Older blocks are compressed sooner or later and are then stored by contract: a query that names the contract stays fast, a few columns can still be searched through per-batch filters, and anything else reads every row. `coverage` prints, for each chain, the ranges, the order of the compressed rows, the filtered columns and the range of `address_selector`, a table of the transactions each selector and address is involved in; `guide old-data` says how to use them. The table behind `coverage` is built into the tool, as read on the day it names, until the platform reports it through its API.
+- **Requests that only read** (every GET, and the endpoints that compile SQL without running it) are sent again when the server fails or does not answer; a query is started once.
 - **Exit codes.** 0 success, 1 the server refused or failed the query, 2 bad arguments, 3 not logged in, 4 the query slots stayed busy, 5 timeout, 130 interrupted.
 - **State.** The login lives in `~/.config/dedaub/monitoring.json`. The access token, the id of the account's scratch query and the slot lock files live in `~/.cache/dedaub-monitoring` (`DEDAUB_MONITORING_STATE_DIR` moves it). In a sandbox that cannot write there, run `dedaub-monitoring status` once outside it: the sandboxed commands then find the lock files and the cached ids.
 - **One stored query.** The API runs SQL only in the context of a stored query, so the tool keeps a single empty one per account, `/_cli/scratch`, and never writes to it.
@@ -111,7 +115,7 @@ Output is TSV by default, `--format json` gives one object per row, `--format cs
 dedaub-monitoring install-skill            # Claude Code, and any of Codex, Cursor, .agents found here
 ```
 
-The skill says when to use the tool, gives the five rules for writing SQL, and points to `dedaub-monitoring guide`. It is also published from this repository as a Claude Code plugin:
+The skill says when to use the tool, gives the rules for writing SQL, and points to `dedaub-monitoring guide`. It is also published from this repository as a Claude Code plugin:
 
 ```
 /plugin marketplace add Dedaub/monitoring-cli

@@ -4,6 +4,7 @@ mod api;
 mod auth;
 mod config;
 mod contracts;
+mod coverage;
 mod error;
 mod frames;
 mod lookups;
@@ -32,6 +33,7 @@ const GUIDE: &str = include_str!("guide.md");
 const GUIDE_CONTRACTS: &str = include_str!("guide_contracts.md");
 const GUIDE_TOKENS: &str = include_str!("guide_tokens.md");
 const GUIDE_INCIDENTS: &str = include_str!("guide_incidents.md");
+const GUIDE_OLD_DATA: &str = include_str!("guide_old_data.md");
 
 /// A page of the guide besides the first.
 #[derive(Clone, Copy, Debug, PartialEq, clap::ValueEnum)]
@@ -39,6 +41,7 @@ enum Page {
     Contracts,
     Tokens,
     Incidents,
+    OldData,
     All,
 }
 
@@ -49,7 +52,8 @@ fn guide(page: Option<Page>) -> String {
         Some(Page::Contracts) => GUIDE_CONTRACTS.to_string(),
         Some(Page::Tokens) => GUIDE_TOKENS.to_string(),
         Some(Page::Incidents) => GUIDE_INCIDENTS.to_string(),
-        Some(Page::All) => [GUIDE, GUIDE_CONTRACTS, GUIDE_TOKENS, GUIDE_INCIDENTS].join("\n"),
+        Some(Page::OldData) => GUIDE_OLD_DATA.to_string(),
+        Some(Page::All) => [GUIDE, GUIDE_CONTRACTS, GUIDE_TOKENS, GUIDE_INCIDENTS, GUIDE_OLD_DATA].join("\n"),
     }
 }
 
@@ -99,7 +103,7 @@ struct Cli {
 
 #[derive(Args, Clone)]
 struct Limits {
-    /// Rows to return (at most 500)
+    /// Rows to return (above 500 they are fetched in pages, at most 5000)
     #[arg(long, default_value_t = 100)]
     limit: u32,
     /// Rows to skip, for the next page
@@ -121,7 +125,7 @@ struct Paging {
     /// Time window, e.g. 1h, 24h, 30d
     #[arg(long, alias = "duration", default_value = "30d")]
     last: String,
-    /// Rows to return (at most 500)
+    /// Rows to return (above 500 they are fetched in pages, at most 5000)
     #[arg(long, default_value_t = 20)]
     limit: u32,
     /// Rows to skip, for the next page
@@ -146,7 +150,7 @@ struct CallColumns {
     /// Add each call's transaction: sender, gas limit, gas used, status
     #[arg(long)]
     tx: bool,
-    /// How many of the newest calls the filters (--failed, --top-level, --from, --to) and --count-by look at
+    /// How many of the newest calls the filters (--failed, --top-level, --from) and --count-by look at
     #[arg(long, default_value_t = 20000, value_name = "N")]
     scan: u32,
     /// The rows as queried, with calldata as hex
@@ -286,7 +290,7 @@ enum Command {
         /// Only contracts deployed by this account, or created by this contract
         #[arg(long, value_name = "ADDRESS")]
         deployer: Option<String>,
-        /// Only contracts with the same bytecode as this one
+        /// Only contracts with the code of this one: its bytecode, or one that differs only in constants (column `same_bytecode`)
         #[arg(long, value_name = "ADDRESS")]
         same_code: Option<String>,
         /// Only contracts without verified source
@@ -295,7 +299,7 @@ enum Command {
         /// Only contracts created in this window, e.g. 24h, 30d
         #[arg(long, alias = "duration", value_name = "WINDOW")]
         last: Option<String>,
-        /// Rows to return (at most 500)
+        /// Rows to return (above 500 they are fetched in pages, at most 5000)
         #[arg(long, default_value_t = 20)]
         limit: u32,
         /// Rows to skip, for the next page
@@ -312,6 +316,15 @@ enum Command {
     Sig { query: String },
     /// The tables of the chain; with a name, the columns and indexes of the matching tables
     Schema { table: Option<String> },
+    /// The blocks each history table holds, from which block its rows are uncompressed, and what leads to rows in either part
+    #[command(after_help = "`indexed` lists the indexes of the uncompressed blocks. Compressed blocks are stored in the one order \
+                      `indexed_compressed` gives: a condition on its first column leads to rows there. A condition on a column \
+                      of `filtered_compressed` skips the batches without the value but looks at every batch of the window, \
+                      and any other condition reads every row. `dedaub-monitoring guide old-data` says what to do then.\n\
+                      `address_selector`, on the chains that have it, lists transactions by the selectors and addresses \
+                      they involve.\n\
+                      The ranges are built into this version, as read on the day the first line names.")]
+    Coverage,
     /// Run a query and print its rows
     Sql {
         #[command(flatten)]
@@ -331,7 +344,8 @@ enum Command {
     },
     /// Print the query guide: lookups, tables, helpers, the rules that keep a query fast; or one of its other pages
     Guide {
-        /// contracts (code and proxies), tokens (balances, transfers, USD), incidents (three queries for an incident), or all
+        /// contracts (code and proxies), tokens (balances, transfers, USD), incidents (three queries for an incident),
+        /// old-data (questions about compressed blocks), or all
         #[arg(value_enum)]
         page: Option<Page>,
     },
@@ -417,10 +431,15 @@ fn read_sql(input: &SqlInput) -> Res<String> {
     String::from_utf8(text).map_err(|_| Fail::Usage("the SQL on stdin is not UTF-8".to_string()))
 }
 
-fn query_opts(cli: &Cli, input: &SqlInput, limits: &Limits) -> Res<QueryOpts> {
-    if limits.limit == 0 || limits.limit > run::MAX_LIMIT {
-        return Err(Fail::Usage(format!("--limit must be between 1 and {}; use --offset for further pages", run::MAX_LIMIT)));
+fn checked_limit(limit: u32) -> Res<u32> {
+    if limit == 0 || limit > run::MAX_ROWS {
+        return Err(Fail::Usage(format!("--limit must be between 1 and {}; --offset gives the rows after those", run::MAX_ROWS)));
     }
+    Ok(limit)
+}
+
+fn query_opts(cli: &Cli, input: &SqlInput, limits: &Limits) -> Res<QueryOpts> {
+    checked_limit(limits.limit)?;
     Ok(QueryOpts {
         chain: chain_name(&cli.chain)?,
         last: input.last.clone(),
@@ -435,9 +454,7 @@ fn query_opts(cli: &Cli, input: &SqlInput, limits: &Limits) -> Res<QueryOpts> {
 }
 
 fn paging_opts(cli: &Cli, paging: &Paging) -> Res<QueryOpts> {
-    if paging.limit == 0 || paging.limit > run::MAX_LIMIT {
-        return Err(Fail::Usage(format!("--limit must be between 1 and {}; use --offset for further pages", run::MAX_LIMIT)));
-    }
+    checked_limit(paging.limit)?;
     Ok(QueryOpts {
         chain: chain_name(&cli.chain)?,
         last: paging.last.clone(),
@@ -706,6 +723,19 @@ fn dispatch(cli: &Cli, interrupted: Arc<AtomicBool>) -> Res<()> {
             print_table(cli, &table, 0)
         }
         Command::Schema { table } => print_text(&lookups::schema(&mut open()?, &chain_name(&cli.chain)?, table.as_deref())?),
+        Command::Coverage => {
+            let chain = chain_name(&cli.chain)?;
+            let (table, notes) = coverage::table(&chain);
+            eprintln!(
+                "# {chain} as read on {}. Newer rows have arrived since, and older blocks get compressed, but never the last {} days.",
+                coverage::read_on(),
+                coverage::ALWAYS_UNCOMPRESSED_DAYS
+            );
+            for text in &notes {
+                run::note(text);
+            }
+            print_table(cli, &table, 0)
+        }
         Command::Expand { input } => compile_only(cli, input, &mut open()?, "preview"),
         Command::Explain { input } => compile_only(cli, input, &mut open()?, "explain"),
     }
@@ -752,11 +782,12 @@ mod tests {
 
     #[test]
     fn every_page_of_the_guide_fits_a_shell_and_the_rules_come_early() {
-        for page in [None, Some(Page::Contracts), Some(Page::Tokens), Some(Page::Incidents)] {
+        for page in [None, Some(Page::Contracts), Some(Page::Tokens), Some(Page::Incidents), Some(Page::OldData)] {
             assert!(guide(page).len() < 30_000, "{page:?} is longer than an agent's shell shows in one piece");
         }
         assert!(matches!(parse(&["guide"]), Ok(Command::Guide { page: None })));
         assert!(matches!(parse(&["guide", "incidents"]), Ok(Command::Guide { page: Some(Page::Incidents) })));
+        assert!(matches!(parse(&["guide", "old-data"]), Ok(Command::Guide { page: Some(Page::OldData) })));
         // Agents read the first hundred or so lines: the rules and the helpers must be there.
         let head: Vec<&str> = GUIDE.lines().take(100).collect();
         for needle in
@@ -766,11 +797,38 @@ mod tests {
         }
         // The whole guide stays small: an example that a lookup or another page already gives is left out.
         let all = guide(Some(Page::All));
-        assert!(all.len() < 30_000, "the guide has grown to {} bytes", all.len());
-        for page in ["guide contracts", "guide tokens", "guide incidents"] {
+        assert!(all.len() < 33_000, "the guide has grown to {} bytes", all.len());
+        for page in ["guide contracts", "guide tokens", "guide incidents", "guide old-data"] {
             assert!(head.iter().any(|line| line.contains(page)), "the first page does not name `{page}`");
         }
         assert!(guide(Some(Page::All)).contains("# dedaub-monitoring guide: an incident"));
+        // What is sure about compression, and where the ranges are.
+        let days = format!("the last {} days", coverage::ALWAYS_UNCOMPRESSED_DAYS);
+        assert!(GUIDE.contains(&days) && GUIDE.contains("dedaub-monitoring coverage"));
+        assert!(matches!(parse(&["coverage", "--chain", "base"]), Ok(Command::Coverage)));
+    }
+
+    #[test]
+    fn the_page_on_old_data_reads_what_coverage_prints() {
+        // The page holds for every chain: what differs between chains is read from `coverage`.
+        for column in ["uncompressed_from_block", "indexed_compressed", "filtered_compressed", "indexed"] {
+            assert!(coverage::COLUMNS.contains(&column) && GUIDE_OLD_DATA.contains(&format!("`{column}`")), "{column}");
+        }
+        assert!(GUIDE_OLD_DATA.contains(&format!("older than {} days", coverage::ALWAYS_UNCOMPRESSED_DAYS)));
+        for needle in
+            [coverage::SIDE_TABLE, "encode_adresses_selectors(ARRAY[", "INTERSECT", "subcalls 0xCONTRACT --to 0xCALLEE", "tx 0xHASH"]
+        {
+            assert!(GUIDE_OLD_DATA.contains(needle), "the page on old data lacks `{needle}`");
+        }
+        assert!(GUIDE.contains("`guide old-data` says how to ask"));
+    }
+
+    #[test]
+    fn limits_above_one_request_are_taken_up_to_the_cap() {
+        assert_eq!(checked_limit(500).unwrap(), 500);
+        assert_eq!(checked_limit(run::MAX_ROWS).unwrap(), run::MAX_ROWS);
+        assert!(matches!(checked_limit(run::MAX_ROWS + 1), Err(Fail::Usage(_))));
+        assert!(matches!(checked_limit(0), Err(Fail::Usage(_))));
     }
 
     #[test]
